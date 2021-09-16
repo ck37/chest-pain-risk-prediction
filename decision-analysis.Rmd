@@ -1,0 +1,165 @@
+---
+title: "Decision curve analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+library(dplyr)
+```
+
+## Import data
+
+```{r import_data}
+# Created in estimator-superlearner.Rmd
+load("data/estimator-cvsl.RData")
+names(cvsl)
+```
+
+### Extract stacked data
+
+```{r extract_stacked}
+# Vector to save the fold id for each observation.
+fold_ids = rep(NA, length(cvsl$SL.predict))
+
+# Number of CV folds (or bootstrap repetitions in theory).
+n_samples = length(cvsl$folds)
+
+# Loop over each SL fold and extract which observations were in that fold.
+for (fold_i in seq(n_samples)) {
+  fold_ids[cvsl$folds[[fold_i]]] = fold_i
+}
+
+
+# Loop over the CVSL folds and extract the predicted value and observed value for the test set.
+test_list = list()
+for (fold_i in seq(n_samples)) {
+  fold = cvsl$AllSL[[fold_i]]
+  test_list[[fold_i]] = 
+    data.frame(observed = cvsl$Y[cvsl$folds[[fold_i]]],
+               sl = fold$SL.predict,
+               fold$library.predict)
+}
+
+stacked_df = data.table::rbindlist(test_list)
+data.table::setDF(stacked_df)
+class(stacked_df)
+head(stacked_df)
+mean((stacked_df$observed - stacked_df$sl)^2)
+mean(abs(stacked_df$observed - stacked_df$sl))
+
+```
+
+## Net benefit curve
+
+### Data prep
+
+```{r net_benefit}
+colnames(cvsl$library.predict)
+
+# Use the stacked DF instead of the results refit to the full dataset, which
+# could benefit from overfitting.
+df = data.frame(Y = stacked_df$observed,
+                sl = stacked_df$sl,
+           #     troponin = data$trop3hv,
+                rf = stacked_df$SL.ranger_2000_All,
+                rpart = stacked_df$SL.rpart_ck_1_All,
+                edacs = stacked_df$SL.stratified_edacs_All,
+                heart = stacked_df$SL.stratified_heart_All,
+                logistic = stacked_df$SL.glm2_All)
+
+summary(df)
+
+thresholds = seq(0, 0.04, by = 0.0002)
+
+```
+
+### Net intevention avoided
+
+```{r dcurves}
+library(dcurves)
+
+# This takes some time.
+system.time({
+dca_analysis = dca(Y ~ edacs + heart + rpart + logistic + rf + sl,
+    data = df,
+    thresholds = thresholds,
+#    include = "all",
+    label = list(edacs = "EDACS",
+                 heart = "HEART",
+                 rpart = "Decision tree",
+                 logistic = "Logistic reg.",
+                 rf = "Random forest",
+                 sl = "SuperLearner")) %>%
+  # This is useful for a rule-out strategy (Vickers et al. 2019 "Step-by-step guide")
+  net_intervention_avoided()
+})
+
+# Performance at 0.5% MACE threshold.
+(mace_0.5 = dca_analysis$dca %>% filter(threshold == 0.005) %>%
+    filter(label != "Treat None") %>%
+    arrange(net_intervention_avoided) %>%
+    mutate(tp_rate = scales::percent(tp_rate, accuracy = 0.01),
+           fp_rate = scales::percent(fp_rate, accuracy = 0.01)) %>%
+    select(label, tp_rate, fp_rate, net_benefit, net_intervention_avoided))
+rio::export(mace_0.5, overwrite = TRUE,
+            file = "tables/net-intervention-0.5pct.xlsx")
+
+library(kableExtra)
+cat(kable(mace_0.5, digits = c(NA, NA, NA, 4, 1), format = "latex", booktabs = TRUE,
+          col.names = c("Estimator", "True positive\nrate", "False positive\nrate",
+          "Net benefit", "Net interventions\navoided"),
+          label = "net-benefit-interventions-avoided") %>%
+      kable_styling(latex_options = "hold_position"),
+      file = "tables/net-benefit-interventions-avoided.tex")
+
+# Export nicer table.
+
+(mace_1.0 = dca_analysis$dca %>% filter(threshold == 0.01) %>%
+    filter(label != "Treat None") %>%
+    arrange(net_intervention_avoided) %>%
+    select(label, tp_rate, fp_rate, net_benefit, net_intervention_avoided))
+rio::export(mace_1.0, overwrite = TRUE,
+            file = "tables/net-intervention-1.0pct.xlsx")
+
+(mace_2.0 = dca_analysis$dca %>% filter(threshold == 0.02) %>%
+    filter(label != "Treat None") %>%
+    arrange(net_intervention_avoided) %>%
+    select(label, tp_rate, fp_rate, net_benefit, net_intervention_avoided))
+rio::export(mace_2.0, overwrite = TRUE,
+            file = "tables/net-intervention-2.0pct.xlsx")
+
+table(cvsl$Y)
+```
+
+### Net benefit plots
+
+```{r net_benefit_return}
+
+#(p1 = dca_analysis  %>% #,
+(p1 = dca_analysis  %>% #,
+  #plot(smooth = TRUE)
+  plot(smooth = FALSE, show_ggplot_code = FALSE) +
+  coord_cartesian(ylim = c(0, 100)))
+
+p1 +
+  #labs(y = "Standardized net benefit") +
+  theme(
+  legend.position = c(0.17, 0.75),
+  legend.title = element_blank(),
+  legend.margin = margin(l = 3, r = 3, b = 1, t = -3),
+  legend.background = element_rect(color = "#f0f0f0",
+                                   fill = "#fafafa")
+) +
+  scale_x_continuous(breaks = seq(0, 0.04, by = 0.01),
+                     #limits = c(0, 0.05),
+                     label = scales::percent_format(accuracy = 1))
+
+#ggsave("visuals/net-benefit-dcurves.png",
+ggsave("visuals/net-intervention-reduction.png",
+       width = 6, height = 4)
+
+ggsave("visuals/net-benefit-dcurves.pdf")
+```

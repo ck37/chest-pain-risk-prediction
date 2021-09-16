@@ -1,0 +1,1331 @@
+---
+title: 'Estimator: SuperLearner'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source("R/_startup.R")
+startup(auto_install = FALSE, verbose = FALSE)
+ck37r::load_all_code("R", verbose = TRUE)
+
+library(ck37r)
+library(SuperLearner)
+library(ggplot2)
+library(xtable)
+library(magrittr)
+
+
+# Use half of the available cores, but no more than 48.
+#options(sl.cores = min(48, round(RhpcBLASctl::get_num_cores()) / 2))
+options(sl.cores = min(48, round(RhpcBLASctl::get_num_cores()) * 0.8))
+getOption("sl.cores")
+```
+
+## Load data
+
+```{r load_data}
+load(paste0(data_dir, "import-data-imputed.RData"))
+names(data)
+# 116,720 obs and 88 variables
+dim(data)
+# 74 covariates
+length(vars$covariates)
+vars$covariates
+
+# ads60d
+(outcome_field = vars$outcomes[1])
+```
+
+## Case weights
+
+```{r case_weights}
+
+# Copied from estimator-trees.Rmd
+case_weights = rep(1, nrow(data))
+
+# Set the positive weight to be the ratio of positive to negative cases.
+# This allows the negative case weights to remain 1.
+# Alternatively we could use inverse probability weights for both positive
+# and negative cases.
+(positive_weight = sum(1 - data[[outcome_field]]) / sum(data[[outcome_field]]))
+case_weights[data[[outcome_field]] == 1] = positive_weight
+
+```
+
+## Prep SL library
+
+```{r prep_sl_library}
+rpart_unpruned = create.Learner("SL.rpart_ck", params = list(loss_positive = positive_weight,
+                                # Use the rpart default cp, since we aren't pruning.
+                                cp = 0.01))
+rpart_pruned = create.Learner("SL.rpart_ck", name_prefix = "SL.rpart_ck_pruned",
+                              params = list(loss_positive = positive_weight, prune = TRUE))
+
+SL.dbarts = SL.dbarts2
+learner_bart =
+  create.Learner("SL.dbarts",
+                 # Turning off detailed_names because binary_offset has a negative value.
+                 #detailed_names = FALSE,
+                 detailed_names = TRUE,
+                 params = list(nthread = getOption("sl.cores")),
+                 tune = list(ntree = c(1, 2, 5, 10, 20, 50, 100, 200, 500)))#,
+
+screen_names = function(Y, X, names = names(X), ...)  {
+    return(names(X) %in% names)
+}
+
+vars_troponin = function(...) screen_names(..., names = "trop_peak")
+vars_trop_ecg = function(...) screen_names(..., names = c("trop_peak", "ecg"))
+vars_trop_ecg_scores = function(...) screen_names(..., names = c("trop_peak", "ecg", "edacs", "heart"))
+
+
+stratified_lib =
+  create.Learner("SL.stratified", detailed_names = TRUE,
+                 tune = list(stratify_on = c("ecg_score", "trop_peak", "edacs", "heart")))
+
+#SL.stratified_edacs_adp = function(...) {
+SL.stratified_heart_ecg_trop = function(...) {
+  SL.stratified(stratify_on = c("heart", "ecg_score", "trop_peak"), ...)
+}
+
+SL.stratified_edacs_ecg_trop = function(...) {
+  SL.stratified(stratify_on = c("edacs", "ecg_score", "trop_peak"), ...)
+}
+
+SL.stratified_ecg_trop = function(...) {
+  SL.stratified(stratify_on = c("ecg_score", "trop_peak"), ...)
+}
+
+preds = data[, c(vars$covariates, outcome_field)] %>%
+  dplyr::group_by(ecg_score, trop_peak) %>%
+  # We prefix with an underscore to minimize any conflict with column names in X.
+  dplyr::mutate(`_pred` = mean(ads60d, na.rm = TRUE),
+                `_size` = dplyr::n()) %>%
+  # Restrict to one row per stratum
+  dplyr::filter(dplyr::row_number() == 1) %>%
+  # We only need the stratum and the prediction.
+  # Make sure to include the grouping cols to avoid a warning message.
+  dplyr::select(dplyr::group_cols(), `_pred`, `_size`) %>% as.data.frame()
+
+table(is.na(preds$`_pred`))
+
+xgb_tune = function(Y, X, newX, family, obsWeights, id, ...) {
+  cat("Running xgb_tune\n")
+  
+  # Create tuning grid.
+  grid = create.Learner("SL.xgboost_fast", detailed_names = TRUE, 
+                        tune = list(
+                          # 27 combos.
+                          ntrees = c(100L, 300L, 1000L),
+                          max_depth = c(1L, 3L, 6L),
+                          shrinkage = c(0.01, 0.1, 0.3)))
+  
+  grid2 = create.Learner("SL.xgboost_fast", detailed_names = TRUE, 
+                        tune = list(
+                          # 8 combos.
+                          ntrees = c(250L, 1000L),
+                          max_depth = c(2L, 4L),
+                          shrinkage = c(0.05, 0.2)))
+  
+  # Run SuperLearner.
+  # id argument is not being passed to avoid an error "stratified sampling with id not currently implemented"
+  sl = SuperLearner(Y = Y, X = X, newX = newX, obsWeights = obsWeights, family = family,
+                    #SL.library = grid$names,
+                    #SL.library = c("SL.mean", grid2$names),
+                    SL.library = grid2$names,
+                    cvControl = SuperLearner.CV.control(stratifyCV = TRUE, V = 5L),
+                    verbose = FALSE)
+  
+  cat("XGB tuned SL:\n")
+  print(sl)
+  
+  # fit returns all objects needed for predict()
+  fit = list(object = sl)
+  
+  # Declare class of fit for predict()
+  class(fit) = 'SuperLearner'
+  
+  out = list(pred = sl$SL.predict, fit = fit)
+  return(out)
+}
+
+rf_tune = function(Y, X, newX, family, obsWeights, id, ...) {
+  cat("Running rf_tune\n")
+  
+  # Create tuning grid.
+  grid = create.Learner("SL.ranger", detailed_names = TRUE, 
+                        params = list(num.threads = get_cores(),
+                                      #num.trees = 700),
+                                      num.trees = 2000),
+                        tune = list(
+                          # 9 combos.
+                          min.node.size = c(5L, 20L, 60L),
+                          mtry = floor(c(0.5, 1, 2) * sqrt(ncol(X)))))
+  
+  # Run SuperLearner.
+  # id argument is not being passed to avoid an error "stratified sampling with id not currently implemented"
+  sl = SuperLearner(Y = Y, X = X, newX = newX, obsWeights = obsWeights, family = family,
+                    #SL.library = c("SL.mean", grid$names),
+                    SL.library = grid$names,
+                    cvControl = SuperLearner.CV.control(stratifyCV = TRUE, V = 5L),
+                    verbose = FALSE)
+  
+  cat("RF tuned SL:\n")
+  print(sl)
+  
+  # fit returns all objects needed for predict()
+  # Save the grid.
+  fit = list(object = sl, grid = grid)
+  
+  # Declare class of fit for predict()
+  class(fit) = 'SuperLearner'
+  
+  out = list(pred = sl$SL.predict, fit = fit)
+  return(out)
+}
+
+glmnet_tune = function(Y, X, newX, family, obsWeights, id, ...) {
+  cat("Running glmnet_tune\n")
+  
+  # Create tuning grid.
+  grid = create.Learner("SL.glmnet_fast", detailed_names = TRUE, 
+                        # 4 combos
+                        tune = list(alpha = c(0.05, 0.3, 0.7, 0.95)))
+  
+  # Run SuperLearner.
+  # id argument is not being passed to avoid an error "stratified sampling with id not currently implemented"
+  sl = SuperLearner(Y = Y, X = X, newX = newX, obsWeights = obsWeights, family = family,
+                    #SL.library = c("SL.mean", grid$names),
+                    SL.library = grid$names,
+                    cvControl = SuperLearner.CV.control(stratifyCV = TRUE, V = 5L),
+                    verbose = FALSE)
+  
+  cat("Glmnet tuned SL:\n")
+  print(sl)
+  
+  # fit returns all objects needed for predict()
+  fit = list(object = sl)
+  
+  # Declare class of fit for predict()
+  class(fit) = 'SuperLearner'
+  
+  out = list(pred = sl$SL.predict, fit = fit)
+  return(out)
+}
+
+rpart_tune = function(Y, X, newX, family, obsWeights, id, ...) {
+  cat("Running rpart_tune\n")
+  
+  # Create tuning grid.
+  grid = create.Learner("SL.rpart_ck", detailed_names = TRUE, 
+                        params = list(loss_positive = positive_weight),
+                        tune = list(cp = c(0, 0.01),
+                                    minsplit = c(10, 20, 80),
+                                    maxdepth = c(10, 30)))
+  
+  # Run SuperLearner.
+  # id argument is not being passed to avoid an error "stratified sampling with id not currently implemented"
+  sl = SuperLearner(Y = Y, X = X, newX = newX, obsWeights = obsWeights, family = family,
+                    #SL.library = c("SL.mean", grid$names),
+                    SL.library = grid$names,
+                    cvControl = SuperLearner.CV.control(stratifyCV = TRUE, V = 5L),
+                    verbose = FALSE)
+  
+  cat("Rpart tuned SL:\n")
+  print(sl)
+  
+  # fit returns all objects needed for predict()
+  fit = list(object = sl)
+  
+  # Declare class of fit for predict()
+  class(fit) = 'SuperLearner'
+  
+  out = list(pred = sl$SL.predict, fit = fit)
+  return(out)
+}
+
+learner_mgcv =
+  create.Learner("SL.mgcv2",
+                 # Turning off detailed_names because binary_offset has a negative value.
+                 #detailed_names = FALSE,
+                 detailed_names = TRUE,
+                 params = list(nthreads = min(10L, get_cores()),
+                               # HEART has 9 unique values but would give an error.
+                               continuous_values = 10L))
+
+
+(sl_lib = c(list("SL.mean",
+                 "SL.stratified_ecg_trop", "SL.stratified_heart_ecg_trop", "SL.stratified_edacs_ecg_trop",
+                 "SL.lm2",
+           c("SL.glm2", "vars_troponin", "vars_trop_ecg", "vars_trop_ecg_scores", "All"),
+           "SL.glmnet_fast"),
+           list(c(rpart_unpruned$names, "vars_troponin", "vars_trop_ecg", "vars_trop_ecg_scores", "All")),
+           stratified_lib$names, 
+           rpart_pruned$names,
+           learner_mgcv$names,
+          list(
+            #"SL.stepAIC", # too slow
+            #"SL.earth",
+#            "SL.polymars",
+            "rpart_tune", # add back
+            "SL.ranger_2000", # add back
+            "rf_tune", # add back
+            "SL.dbarts_500", # 200 trees is the default -- add back
+            "xgb_tune", # add back
+            "SL.xgboost_fast")))
+
+```
+
+## Estimate SL
+
+```{r estimate_sl, error = TRUE, eval = FALSE}
+set.seed(1, "L'Ecuyer-CMRG")
+
+if (FALSE) { # Run manually for glmnet grid.
+  doParallel::registerDoParallel(cores = get_cores())
+  doParallel::registerDoParallel(cores = 2)
+}
+ 
+(sl = SuperLearner(Y = data[[outcome_field]], data[, vars$covariates],
+                  family = binomial(), SL.library = sl_lib,
+                  cvControl = SuperLearner.CV.control(stratifyCV = TRUE,
+                                                      V = 10L),
+                                                      #V = 2L),
+                  verbose = TRUE))
+
+save(sl,
+     file = "data/estimator-sl.RData")
+
+```
+
+### Review SL results
+
+```{r review_sl, error= TRUE, eval = FALSE}
+load("data/estimator-sl.RData")
+
+sl_names = 
+  c("Marginal mean",
+    "Stratification (trop., ECG)",
+    "Stratification (trop., ECG, HEART)",
+    "Stratification (trop., ECG, EDACS)",
+    "Linear reg.",
+    "Logistic reg. (trop.)",
+    "Logistic reg. (trop., ECG)",
+    "Logistic reg. (trop., ECG, scores)",
+    "Logistic reg.",
+    "Lasso",
+    "Decision tree (trop.)",
+    "Decision tree (trop., ECG)",
+    "Decision tree (trop., ECG, scores)",
+    "Decision tree",
+    "Stratification (ECG)",
+    "Stratification (trop.)",
+    "Stratification (EDACS)",
+    "Stratification (HEART)",
+    "Decision tree pruned",
+    "Splines",
+    "Decision tree tuned",
+    "Random forest",
+    "Random forest tuned",
+    "BART",
+    "XGBoost tuned",
+    "XGBoost")
+
+# These are the names used by auc_table()
+old_sl_names = names(sl$cvRisk)
+names(sl$cvRisk) = sl_names
+
+(auc_tab = ck37r::auc_table(sl, y = data[[outcome_field]]))
+
+# Drop p-value column.
+auc_tab2 = auc_tab[, !names(auc_tab) %in% "p-value"]
+
+print(xtable::xtable(auc_tab2, digits = 4), type = "latex",
+      file = "tables/sl-auc_table.tex")
+
+ck37r::plot_roc(sl, y = data[[outcome_field]])
+ggsave("visuals/roc-superlearner.pdf")
+
+plot_table = function(x,
+                      metric = "auc",
+                      sort = TRUE) {
+
+  # Use a clearer object name.
+  tab = x
+
+  if (!is.null(sort)) {
+    tab = tab[order(tab[[metric]], decreasing = sort), ]
+  }
+
+  # Convert to a factor with manual levels so ggplot doesn't re-order
+  # alphabetically.
+  tab$learner = factor(tab$learner, levels = tab$learner)
+
+  rownames(tab) = NULL
+
+  p =
+    ggplot2::ggplot(tab,
+           aes(x = learner, y = get(metric), ymin = ci_lower, ymax = ci_upper)) +
+      ggplot2::geom_pointrange(fatten = 2) +
+      ggplot2::coord_flip() +
+      ggplot2::labs(x = "Learner", y = metric) + theme_minimal()
+
+  return(p)
+}
+
+# Skip SL.mean - it's too low to be worth plotting.
+plot_table(auc_tab[-1, ]) + labs(y = "Cross-validated ROC-AUC")
+#ggsave("visuals/sl-roc-auc-comparison.png")
+ggsave("visuals/sl-roc-auc-comparison.pdf")
+
+
+if (FALSE) {
+  names(sl$cvRisk)
+  ck37r::plot_roc(sl, y = data[[outcome_field]], learner = 5,
+                  title = "Logistic regression cross-validated ROC",
+                  subtitle = "")
+  ggsave("visuals/roc-sl-glm.png")
+  
+  ck37r::plot_roc(sl, y = data[[outcome_field]], learner = 3,
+                  title = "Lasso cross-validated ROC",
+                  subtitle = "")
+  ggsave("visuals/roc-sl-lasso.png")
+  
+  ck37r::plot_roc(sl, y = data[[outcome_field]], learner = "SL.ranger_All",
+                  title = "Random Forest cross-validated ROC",
+                  subtitle = "")
+  ggsave("visuals/roc-sl-rf.png")
+}
+```
+
+### SL PR-AUC
+
+```{r sl_prauc, error = TRUE, eval = FALSE}
+(prauc_tab = ck37r::prauc_table(sl, y = data[[outcome_field]]))
+
+print(xtable::xtable(prauc_tab, digits = 4), type = "latex",
+      file = "tables/sl-prauc_table.tex")
+
+plot_table(prauc_tab, metric = "prauc") + labs(y = "Cross-validated PR-AUC")
+#ggsave("visuals/sl-prauc-comparison.png")
+ggsave("visuals/sl-prauc-comparison.pdf")
+```
+
+### SL plots
+
+```{r sl_plots, error = TRUE, eval = FALSE}
+#library(classifierplots)
+library(dplyr)
+
+df = data.frame(y = data[[outcome_field]],
+                pred = as.vector(sl$SL.predict))
+
+df = df %>% mutate(decile = ntile(pred, 10L),
+                   vigintile = ntile(pred, 20L)) %>% as.data.frame()
+
+table(df$decile)
+
+summary(df)
+
+# Compare risk distribution for 0's vs 1's
+ggplot(data = df, aes(x = pred, color = factor(y))) + 
+  geom_density() + theme_minimal() +
+  labs(title = "Distribution of predicted risk for 0's vs 1's",
+         x = "Predicted risk Pr(Y = 1 | X)",
+         y = "Density")
+
+# Look at the risk distribution for each learner.
+for (learner_i in seq(ncol(sl$Z))) {
+  learner_name = sl$libraryNames[learner_i]
+  preds = sl$Z[, learner_i, drop = TRUE]
+  
+  df = data.frame(y = data[[outcome_field]],
+                  pred = preds)
+  
+  g = ggplot(data = df, aes(x = pred, color = factor(y))) + 
+    geom_density() + theme_minimal() +
+    labs(title = "Distribution of predicted risk for 0's vs 1's",
+         subtitle = paste("Learner:", learner_name), 
+         x = "Predicted risk Pr(Y = 1 | X)",
+         y = "Density")
+  
+  print(g)
+
+}
+
+
+ggplot(data = df, aes(x = pred, color = factor(y))) + 
+  geom_freqpoly() + theme_minimal()
+
+# Calibration plot
+ggplot(data = df, aes(x = pred, y = y)) + 
+  geom_smooth() + theme_minimal() +
+  lims(y = c(0, 1))
+
+ggplot(data = df, aes(x = pred, y = y)) + 
+  # This crashes R due to lack of memory.
+  #geom_smooth(method = "loess") + theme_minimal() +
+  geom_smooth() + theme_minimal() +
+  lims(y = c(0, 1), x = c(0, 0.1))
+
+ggplot(data = df, aes(x = log(pred), y = y)) + 
+  geom_smooth() + theme_minimal() +
+  lims(y = c(0, 1), x = c(0, log(0.1)))
+
+# Divide score into deciles
+
+df %>% group_by(decile) %>%
+  summarize(pred_risk = mean(pred),
+            actual_risk = mean(y),
+            pred_over_actual = pred_risk / actual_risk)
+
+df %>% group_by(vigintile) %>%
+  summarize(pred_risk = mean(pred),
+            actual_risk = mean(y),
+            pred_over_actual = pred_risk / actual_risk)
+
+# Deciles of probabilities among the 1's
+thresholds = quantile(df$pred[df$y == 1], probs = seq(0, 1, by = 1 / 10))
+
+dim(df)
+
+thresholds
+
+# Manually add a 0 threshold.
+tiles = cut(df$pred, breaks = c(0, thresholds), labels = FALSE)
+table(tiles)
+
+# Then apply cut to group based on that threshold.
+
+```
+
+## Estimate CV.SL
+
+Note: we are not currently saving the fitLibraries.
+
+```{r estimate_cvsl, eval = TRUE, error = TRUE}
+set.seed(1, "L'Ecuyer-CMRG")
+outer_cv_folds = 5L
+#outer_cv_folds = 10L
+(cvsl =
+    CV.SuperLearner(Y = data[[outcome_field]], data[, vars$covariates],
+          family = binomial(), SL.library = sl_lib,
+          cvControl =
+            SuperLearner.CV.control(stratifyCV = TRUE,
+                                    #V = 10L),
+                                    V = outer_cv_folds),
+          innerCvControl =
+            rep(list(SuperLearner.CV.control(stratifyCV = TRUE,
+                                             #V = 5L)),
+                                             V = 10L)),
+                outer_cv_folds),
+          verbose = TRUE))
+
+save(cvsl,
+     file = "data/estimator-cvsl.RData")
+
+summary(cvsl)
+
+
+#colnames(cvsl$library.predict) = cvsl$libraryNames
+#cvsl$SL.library$library = cvsl$libraryNames
+#cvsl$SL.library$screenAlgorithm = c("", "", "", "")
+
+# this is what is used in plot.CV.SuperLearner
+
+plot(cvsl) + theme_minimal() + 
+  labs(y = "Cross-validated mean-squared error")
+ggsave("visuals/cvsl-rmse-plot.png")
+
+
+```
+
+### Review CV.SL
+
+```{r review_cvsl, eval = TRUE, error = TRUE}
+library(dplyr)
+load("data/estimator-cvsl.RData")
+
+# Update learner names.
+(oldnames = cvsl$libraryNames)
+cvsl$libraryNames =
+  sl_names = 
+  c("Marginal mean",
+    "Stratification (trop., ECG)",
+    "Stratification (trop., ECG, HEART)",
+    "Stratification (trop., ECG, EDACS)",
+    "Linear reg.",
+    "Logistic reg. (trop.)",
+    "Logistic reg. (trop., ECG)",
+    "Logistic reg. (trop., ECG, scores)",
+    "Logistic reg.",
+    "Lasso",
+    "Decision tree (trop.)",
+    "Decision tree (trop., ECG)",
+    "Decision tree (trop., ECG, scores)",
+    "Decision tree",
+    "Stratification (ECG)",
+    "Stratification (trop.)",
+    "Stratification (EDACS)",
+    "Stratification (HEART)",
+    "Decision tree pruned",
+    "Splines",
+    "Decision tree tuned",
+    "Random forest",
+    "Random forest tuned",
+    "BART",
+    "XGBoost tuned",
+    "XGBoost")
+
+colnames(cvsl$coef) = cvsl$libraryNames
+  
+cvsl$libraryNames
+
+# Will need to update cvsl learner names again (see above).
+# this is what is used in plot.CV.SuperLearner
+colnames(cvsl$coef) = cvsl$libraryNames
+
+library(ck37r)
+
+
+######
+# AUC analysis
+
+(auc_tab = auc_table(cvsl))
+
+
+# Drop p-value column.
+auc_tab2 = auc_tab[, !names(auc_tab) %in% "p-value"]
+
+# Convert rownames to learner column.
+
+auc_tab2$learner = rownames(auc_tab2)
+# Move learner column to the beginning.
+(auc_tab2 = cbind(learner = auc_tab2$learner,
+                  auc_tab2[, !names(auc_tab2) %in% "learner"]))
+colnames(auc_tab2)[1] = "learner"
+rownames(auc_tab2) = NULL
+
+# Skip SL.mean - it's too low to be worth plotting.
+plot_table(auc_tab2[-1, ]) + labs(y = "Cross-validated ROC-AUC")
+#ggsave("visuals/cvsl-roc-auc-comparison.png")
+ggsave("visuals/cvsl-roc-auc-comparison.pdf")
+
+plot_roc(cvsl)
+ggsave("visuals/cvsl-roc.pdf")
+
+names(auc_tab2)
+
+names(auc_tab2) = c("Learner", "ROC-AUC", "Std. Err.", "CI Lower", "CI Upper")
+
+cat(kable(auc_tab2, digits = 4, format = "latex", booktabs = TRUE,
+          label = "cvsl-auc",
+          caption = "Cross-validated ROC-AUC discrimination performance"),
+      file = "tables/cvsl-auc_table.tex")
+
+
+######
+# Precision-Recall analysis
+
+(prauc_tab = prauc_table(cvsl))
+
+prauc_tab$learner = rownames(prauc_tab)
+rownames(prauc_tab) = NULL
+# Move learner column to the beginning.
+(prauc_tab = cbind(learner = prauc_tab$learner,
+                   prauc_tab[, !names(prauc_tab) %in% "learner"]))
+
+
+
+plot_table(prauc_tab, metric = "prauc") + labs(y = "Cross-validated PR-AUC")
+#ggsave("visuals/cvsl-prauc-comparison.png")
+ggsave("visuals/cvsl-prauc-comparison.pdf")
+
+plot_table(prauc_tab, metric = "prauc") + labs(y = "Cross-validated PR-AUC")
+ggsave("visuals/cvsl-prauc-comparison.pdf")
+
+
+################
+# Precision-recall curve comparison.
+str(cvsl$library.predict)
+
+pred_lib = data.frame(cvsl$library.predict)
+
+names(pred_lib) = cvsl$libraryNames
+
+# Extract RF Tuned, XGB Tuned, Splines, GLM, OLS
+#learners =
+#  c("SL.lm2_All", "SL.glm2_All", "SL.stratified_heart_ecg_trop_All", "SL.mgcv2_1_All",
+#    "rpart_tune_All", "rf_tune_All", "SL.dbarts_500_All", "xgb_tune_All")]
+
+learners =
+  c(#"Linear reg.",
+    "Decision tree tuned",
+    "Stratification (trop., ECG, HEART)",
+    "Logistic reg.",
+    #"Splines",
+    "XGBoost tuned",
+    "BART",
+    "Random forest tuned",
+    NULL)
+
+pred_df = pred_lib[, learners]
+
+summary(pred_df)
+
+# Add on the SuperLearner prediction.
+pred_df$SuperLearner = cvsl$SL.predict
+
+library(precrec)
+library(ggplot2)
+
+(sscurves = evalmod(scores = pred_df,
+                    labels = cvsl$Y,
+                    modnames = names(pred_df)))
+
+# Show a Precision-Recall plot comparing all 3 scores.
+autoplot(sscurves, "PRC") +
+  labs(title = element_blank()) +
+  theme(legend.position = c(0.65, 0.65),
+        legend.text = element_text(size = 8), #face = "bold"),
+        legend.margin = margin(l = 0.2, r = 0.2, b = 0.2, unit = "cm"),
+        legend.background = element_rect(fill = alpha("gray95", 0.8),
+                                         color = "gray80"),
+        legend.key = element_blank())
+ggsave("visuals/prc-comparison.pdf",
+       width = 4, height = 4)
+
+
+################
+# PR-AUC table
+names(prauc_tab) = c("Learner", "PR-AUC", "Std. Err.", "CI Lower", "CI Upper")
+
+cat(kable(prauc_tab, digits = 4, format = "latex", booktabs = TRUE,
+          label = "cvsl-prauc",
+          caption = "Cross-validated PR-AUC discrimination performance") %>%
+      kable_styling(latex_options = "hold_position"),
+      file = "tables/cvsl-prauc_table.tex")
+
+
+# Review weight distribution.
+(weight_tab = ck37r::cvsl_weights(cvsl))
+
+# Remove algorithms with 0 weight.
+(weight_tab = weight_tab[weight_tab$Max > 0, ])
+
+cat(kable(weight_tab, digits = 4, format = "latex", booktabs = TRUE,
+          label = "cvsl-weights",
+          row.names = FALSE,
+          caption = "Distribution of algorithm weights across ensemble cross-validation replications") %>%
+      kable_styling(latex_options = "hold_position"),
+      file = "tables/cvsl-weight-table.tex")
+
+##########################
+# Brier score table.
+
+(brier_tab = ck37r::brier_table(cvsl))
+
+
+names(brier_tab) = c("Brier score", "Std. Err.", "CI Lower", "CI Upper")
+
+brier_tab = cbind(Learner = rownames(brier_tab), brier_tab)
+
+rownames(brier_tab) = NULL
+
+cat(kable(brier_tab, digits = 5, format = "latex", booktabs = TRUE,
+          label = "cvsl-brier",
+          row.names = FALSE,
+          caption = "Cross-validated Brier score for each learner and the ensemble") %>%
+      kable_styling(latex_options = "hold_position"),
+      file = "tables/cvsl-brier-table.tex")
+
+##########################
+# Index of prediction accuracy table.
+
+(ipa_tab = ck37r::ipa_table(cvsl))
+
+
+names(ipa_tab) = c("IPA", "Std. Err.", "CI Lower", "CI Upper")
+
+ipa_tab = cbind(Learner = rownames(ipa_tab), ipa_tab)
+
+rownames(ipa_tab) = NULL
+
+cat(kable(ipa_tab, digits = 4, format = "latex", booktabs = TRUE,
+          label = "cvsl-ipa",
+          row.names = FALSE,
+          caption = "Cross-validated index of prediction accuracy for each learner and the ensemble") %>%
+      kable_styling(latex_options = "hold_position"),
+      file = "tables/cvsl-ipa-table.tex")
+
+```
+
+## Review calibration
+
+```{r review_calibration, eval = TRUE}
+
+learner_name = "CV.SL"
+preds = cvsl$SL.predict
+summary(preds)
+  
+
+# Here we are prone to overfitting, due to the SuperLearner being retrained
+# on the full dataset.
+df = data.frame(y = data[[outcome_field]],
+                pred = preds)
+
+# Instead use the stacked test sets.
+
+# Vector to save the fold id for each observation.
+fold_ids = rep(NA, length(cvsl$SL.predict))
+
+# Number of CV folds (or bootstrap repetitions in theory).
+n_samples = length(cvsl$folds)
+
+# Loop over each SL fold and extract which observations were in that fold.
+for (fold_i in seq(n_samples)) {
+  fold_ids[cvsl$folds[[fold_i]]] = fold_i
+}
+
+
+# Loop over the CVSL folds and extract the predicted value and observed value for the test set.
+test_list = list()
+for (fold_i in seq(n_samples)) {
+  fold = cvsl$AllSL[[fold_i]]
+  test_list[[fold_i]] = 
+    data.frame(observed = cvsl$Y[cvsl$folds[[fold_i]]],
+               sl = fold$SL.predict,
+               fold$library.predict)
+}
+
+stacked_df = data.table::rbindlist(test_list)
+data.table::setDF(stacked_df)
+
+df = stacked_df
+names(df)[1:2] = c("y", "pred")
+
+dim(df)
+table(df$y)
+
+tapply(df$pred, df$y, summary)
+
+df = df %>% mutate(decile = ntile(pred, 10L),
+                   vigintile = ntile(pred, 20L)) %>% as.data.frame()
+
+
+# Calculate loess prior to plotting - this allows us to reduce the y axis maximum.
+result = stats::loess(y ~ pred, data = df, span = 0.05)
+result
+#pred_loess = predict(result, se = TRUE)
+# Loess is generating some negative predictions, unclear how this could happen.
+df$smooth_0.05 = pmax(result$fitted, 0.000001)
+
+# Try a larger span.
+result = stats::loess(y ~ pred, data = df, span = 0.1)
+
+# Loess is generating some negative predictions, unclear how this could happen.
+df$smooth_0.1 = pmax(result$fitted, 0.000001)
+summary(df$smooth_0.1)
+names(result)
+summary(result$fitted) 
+
+# Try a larger span.
+result = stats::loess(y ~ pred, data = df, span = 0.2)
+df$smooth_0.2 = pmax(result$fitted, 0.000001)
+summary(df$smooth_0.2)
+summary(result$fitted) 
+
+# Examine distribution of predicted risk.
+summary(df$pred)
+tapply(df$pred, df$y, summary)
+
+# Examine empirical CDF
+empirical_cdf = ecdf(df$pred)
+# 99.3% of obs are < 20% predicted risk.
+empirical_cdf(0.2)
+# 95% are less than 8.6% predicted risk.
+quantile(empirical_cdf, 0.95)
+```
+
+### Calibration plots
+
+#### Grouped calibration df
+
+```{r calibration_grouped}
+
+df$groups_10 = Hmisc::cut2(df$pred, g = 10)
+table(df$groups_10, useNA = "ifany")
+
+
+df$groups_20 = Hmisc::cut2(df$pred, g = 20)
+table(df$groups_20, useNA = "ifany")
+
+# Run regression with no intercept.
+# This gives us the point estimate and the standard error for the CIs.
+reg = lm(y ~ groups_10 - 1, data = df)
+summary(reg)
+(conf_int = data.frame(confint(reg)))
+names(conf_int) = c("ci_lower", "ci_upper")
+
+# Bound ci_lower above 0.
+# Lower_lim depends on the axis bounds for the chart.
+lower_lim = 0.00005
+conf_int$ci_lower[conf_int$ci_lower < lower_lim] = lower_lim + 1e-5
+
+conf_int
+
+# Combine everything into a group dataframe.
+group_df =
+  cbind.data.frame(
+    group = seq(10),
+    cutpoints = levels(df$groups_10),
+    pred_risk = tapply(df$pred, df$groups_10, mean),
+    point_est = coef(reg),
+    conf_int
+    )
+
+rownames(group_df) = NULL
+group_df
+
+```
+
+
+#### Log-scale calibration plot
+
+```{r main_plot}
+library(ggrepel)
+
+########################
+# Log scale with density below.
+
+label_df = data.frame(
+  label = c("0.5%", "1%", "2%"),
+  x = c(0.005, 0.01, 0.02),
+  y = rep(1, 3),
+  stringsAsFactors = FALSE
+)
+
+# Initial plot is the risk calibration plot.
+(breaks = c(0.0001, 0.0005, 0.002,  0.01, 0.04, 0.2, 1))
+(limits = c(0.00005, 1))
+(labels = c("0.05%"))
+(labels = c("0.01%", "0.05%", "0.2%", "1%", "4%", "20%", "100%"))
+# Bound the smoothed value to ensure it's shown on the plot.
+df$smooth_0.2_bounded = pmax(df$smooth_0.2, limits[1] + 1e-7)
+limits[1]
+summary(df$smooth_0.2)
+summary(df$smooth_0.2_bounded)
+(p1 = ggplot(data = df, aes(x = pred,
+                            #y = smooth_0.2)) +
+                            y = smooth_0.2_bounded)) +
+  geom_abline(slope = 1, intercept = 0, color = "red") + 
+  geom_point(alpha = 0.005, stroke = 0, size = 1)  + geom_line(alpha = 0.5) +
+  theme_minimal() + labs(x = "Predicted risk (ensemble model)", y = "Actual risk") +
+  scale_x_log10(breaks = breaks, limits = limits, label = labels) +
+  scale_y_log10(breaks = breaks, limits = limits, label = labels) +
+  # Add grouped points + CIs - this dataframe is calculated in the above block.
+  geom_point(data = group_df, aes(x = pred_risk, y = point_est),
+             show.legend = FALSE) +
+  geom_errorbar(data = group_df,
+                aes(ymin = ci_lower, ymax = ci_upper,
+                    x = pred_risk, y = point_est),
+                alpha = 0.8) +
+  # Add clinical thresholds
+  geom_vline(xintercept = label_df$x, color = "blue", alpha = 0.5) +
+  geom_label_repel(data = label_df, aes(x = x, y = y, label = label),
+                   nudge_x = 0, na.rm = TRUE) + 
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank())) 
+
+# Density plot of sample distribution across predicted probability.
+(p2 = ggplot(data = df, aes(x = pred)) +
+  geom_density(fill = "gray70", color = "gray40") +
+  #geom_histogram(fill = "gray70", color = "gray40") +
+  theme_minimal() + labs(y = "Sample\nDistribution") +
+  scale_x_log10(breaks = breaks, limits = limits, labels = scales::percent_format(accuracy = 0.01)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 8),
+        # Include x-axis major gridlines to ensure that plots are aligned.
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank()))
+
+# Stack the two plots.
+cowplot::plot_grid(p1, p2, align = "v", ncol = 1, rel_heights = c(0.9, 0.1))
+ggsave("visuals/calibration-plot-cvsl-log-grouped-stacked.png")
+ggsave("visuals/calibration-plot-cvsl-log-grouped-stacked.pdf")
+```
+
+#### Add divergent bar plot 
+
+```{r divergent_plot}
+library(dplyr)
+library(tidyr)
+
+# Add another frequency distribution per TRIPOD page 52 (reproduced from Genders et al. 2012).
+# This is called a divergent bar plot.
+
+
+(breaks_log10 = seq(log10(0.00001), log10(0.56), length.out = 50))
+
+# Create a summary dataframe manually for the log scale.
+(log_df = data.frame(log_breaks = breaks_log10,
+                     breaks = 10^breaks_log10,
+                     avg_pred_risk = NA,
+                     zeroes = 0,
+                     ones = 0))
+
+# Loop over each interval
+for (i in seq_along(breaks_log10)) {
+  log_break_i = breaks_log10[i]
+  break_i = 10^log_break_i
+  if (i == 1) {
+    lower_bound_log10 = 0
+    lower_bound = 0
+  } else {
+    lower_bound_log10 = breaks_log10[i - 1]
+    lower_bound = 10^lower_bound_log10
+  }
+  
+  # How many observations fall into this range?
+  in_bounds = df$pred >= lower_bound & df$pred < break_i 
+  
+  if (sum(in_bounds) > 0) {
+    log_df$zeroes[i] = sum(df$y[in_bounds] == 0)
+    log_df$ones[i] = sum(df$y[in_bounds])
+  }
+  
+  # Take the mean of the lower and upper bound on log scale, then exponentiate
+  # I.e. we don't weight by sample size.
+  log_df$avg_pred_risk[i] = 10^(mean(c(lower_bound_log10, log_break_i)))
+}
+
+log_df
+
+log_df$zeroes = -1 * log_df$zeroes
+log_df$log_zeroes = -1 * log_df$zeroes
+
+(long_df_log10 = log_df %>% tidyr::pivot_longer(cols = c("zeroes", "ones"), names_to = "status"))
+# One weird trick to multiply only the zeroes by -1.
+long_df_log10$log_value = log(abs(long_df_log10$value)) * (-1)^(long_df_log10$status == "zeroes")
+
+# Replace Inf with NA; this is due to taking a log of 0.
+long_df_log10$log_value[is.infinite(long_df_log10$log_value)] = NA
+
+as.data.frame(long_df_log10) #%>% subset(status == "zeroes")
+
+(p3 = ggplot(data = long_df_log10 %>% filter(value != 0),
+             aes(x = avg_pred_risk,
+                 # Log value is easier to see but misleads the eye. 
+                 #y = log_value,
+                 # Linear value yields near-invisible counts for SMM = 1
+                 y = value,
+                 color = status)) +
+    geom_segment(aes(xend = avg_pred_risk,
+                     yend = 0), show.legend = FALSE, size = 0.5) +
+    theme_minimal() +
+    labs(x = element_blank(),
+         #y = "Log observation\ncount") +
+         y = "Observation\ncount") +
+    scale_x_log10(limits = limits, breaks = breaks) +
+    scale_color_manual(values = c("red", "gray50")) +
+    geom_hline(yintercept = 0, color = "gray20", size = 0.3, alpha = 0.3) +
+    annotate("text", label = "1", x = limits[1], y = 700, color = "red") +
+    annotate("text", label = "0", x = limits[1], y = -700, color = "gray30") +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          #panel.grid.major.x = element_blank(),
+          axis.title.y = element_text(size = 8),
+          axis.text.y = element_blank(),
+          axis.text.x = element_blank(),
+          NULL))
+
+# Stack the three plots.
+#cowplot::plot_grid(p1, p2, p3, align = "v", ncol = 1,
+#                   rel_heights = c(0.6, 0.1, 0.3))
+
+# Try skipping the second plot.
+cowplot::plot_grid(p1, p3, align = "v", ncol = 1,
+                   rel_heights = c(0.75, 0.25))
+
+ggsave("visuals/calibration-plot-cvsl-log-grouped-stacked-divergent.png",
+       width = 6, height = 4, dpi = 500)
+
+ggsave("visuals/calibration-plot-cvsl-log-grouped-stacked-divergent.pdf",
+       width = 6, height = 4, dpi = 500)
+
+```
+
+#### More plots
+
+
+```{r calibration_plots, eval = TRUE}
+
+# Currently crashes.
+# g = ggplot(data = df, aes(x = pred, color = factor(y))) + 
+#     geom_density() + theme_minimal() +
+#     labs(title = "Distribution of predicted risk for 0's vs 1's",
+#          subtitle = paste("Learner:", learner_name), 
+#          x = "Predicted risk Pr(Y = 1 | X)",
+#          y = "Density")
+# print(g)
+# ggsave("visuals/cvsl-prediction-vs-label-comparison.png")
+
+# SuperLearner calibration looks amazing! Is this due to geom_smooth() not using lowess?
+# ggplot(data = df, aes(x = pred, y = y)) + 
+#   # Gam version.
+#   geom_smooth() + theme_minimal() +
+#   geom_abline(slope = 1, intercept = 0, color = "red") +
+#   lims(y = c(0, 1))
+
+# Not enough memory on Lawrence's server (smaller box)
+if (FALSE) {
+  ggplot(data = df, aes(x = pred, y = y)) + 
+    # loess version.
+    geom_smooth(method = "loess", span = 0.01) + theme_minimal() +
+    geom_abline(slope = 1, intercept = 0, color = "red") +
+    lims(y = c(0, 1))
+  ggsave("visuals/calibration-plot-cvsl-0.01.png")
+}
+
+
+# Skip these for now - use precalculated smooths.
+if (FALSE) {
+  ggplot(data = df, aes(x = pred, y = y)) + 
+    # loess version.
+    geom_smooth(method = "loess", span = 0.05) + theme_minimal() +
+    geom_abline(slope = 1, intercept = 0, color = "red") +
+    # ylim sadly cannot go below 1 due to the smoothing algorithm, even though we don't need those higher probabilities.
+    lims(y = c(0, 1)) +
+    labs(x = "Predicted risk", y = "Observed risk")
+  ggsave("visuals/calibration-plot-cvsl-0.05.png")
+  
+  
+  # Focus on 0 - 5% risk.
+  ggplot(data = df[df$pred < 0.2, ], aes(x = pred, y = y)) + 
+    # loess version.
+    geom_smooth(method = "loess", span = 0.05) + theme_minimal() +
+    geom_abline(slope = 1, intercept = 0, color = "red") +
+    # ylim sadly cannot go below 1 due to the smoothing algorithm, even though we don't need those higher probabilities.
+    lims(y = c(0, 1), x = c(0, 0.05)) +
+    labs(x = "Predicted risk", y = "Observed risk")
+  ggsave("visuals/calibration-plot-cvsl-zoom-0.05.png")
+}
+  
+# Use precalculated loess
+ggplot(data = df, aes(x = pred, y = smooth_0.05)) + 
+  # loess version.
+  geom_line() + theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  lims(y = c(0, 0.65)) +
+  labs(x = "Predicted risk", y = "Observed risk")
+ggsave("visuals/calibration-plot-cvsl-precalc-0.05.png")
+
+########################
+# Log scale with density below.
+
+label_df = data.frame(
+  label = c("0.5%", "1%", "2%"),
+  x = c(0.005, 0.01, 0.02),
+  y = rep(1, 3),
+  stringsAsFactors = FALSE
+)
+
+library(ggrepel)
+
+#######################
+
+# Initial plot is the risk calibration plot.
+#(breaks = c(0.0005, 0.002,  0.01, 0.04, 0.2, 1))
+#(limits = c(0.00005, 1))
+(p1 = ggplot(data = df, aes(x = pred, y = smooth_0.2)) +
+  geom_abline(slope = 1, intercept = 0, color = "red") + 
+  geom_point(alpha = 0.007, stroke = 0) + geom_line(alpha = 0.5) +
+  theme_minimal() + labs(x = "Predicted risk", y = "Actual risk") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+ #scale_x_log10(breaks = breaks, limits = limits) +
+  #scale_y_log10(breaks = breaks, limits = limits) +
+  #geom_vline(xintercept = label_df$x, color = "blue", alpha = 0.5) +
+  #geom_label_repel(data = label_df, aes(x = x, y = y, label = label),
+  #                 nudge_x = 0, na.rm = TRUE) + 
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank())) 
+
+# Density plot of sample distribution across predicted probability.
+(p2 = ggplot(data = df, aes(x = pred)) +
+  geom_density(fill = "gray70", color = "gray40") +
+  theme_minimal() + labs(y = "Sample\nSize") +
+  #scale_x_log10(breaks = breaks, limits = limits) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 8),
+        # Include x-axis major gridlines to ensure that plots are aligned.
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank()))
+
+# Stack the two plots.
+cowplot::plot_grid(p1, p2, align = "v", ncol = 1, rel_heights = c(0.9, 0.1))
+#ggsave("visuals/calibration-stacked.pdf", width = 6, height = 4)
+# Too many points to export as a PDF.
+ggsave("visuals/calibration-stacked.png", width = 6, height = 4, dpi = 500)
+
+########
+# Zoom in to max(x) = 10% predicted risk.
+limits = c(0, 0.1)
+label_df$y = 0.1
+labels = c("0%", "2.5%", "5%", "7.5%", "10%")
+(p1 = ggplot(data = df, aes(x = pred, y = smooth_0.2)) +
+  geom_abline(slope = 1, intercept = 0, color = "red") + 
+  geom_point(alpha = 0.007, stroke = 0) + geom_line(alpha = 0.5) +
+  theme_minimal() + labs(x = "Predicted risk (ensemble model)", y = "Actual risk") +
+ # lims(x = limits, y = limits) + 
+  scale_x_continuous(labels = labels, limits = limits) +
+  scale_y_continuous(labels = labels, limits = limits) +
+  #scale_x_log10(breaks = breaks, limits = limits) +
+  #scale_y_log10(breaks = breaks, limits = limits) +
+  geom_vline(xintercept = label_df$x, color = "blue", alpha = 0.5) +
+  geom_label_repel(data = label_df, aes(x = x, y = y, label = label),
+                   nudge_x = 0, na.rm = TRUE) + 
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank())) 
+
+# Density plot of sample distribution across predicted probability.
+(p2 = ggplot(data = df, aes(x = pred)) +
+  geom_density(fill = "gray70", color = "gray40") +
+  #geom_histogram(fill = "gray70", color = "gray40") +
+  theme_minimal() + labs(y = "Sample\nSize") + lims(x = limits) + 
+  #scale_x_log10(breaks = breaks, limits = limits) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 8),
+        # Include x-axis major gridlines to ensure that plots are aligned.
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank()))
+
+# Stack the two plots.
+cowplot::plot_grid(p1, p2, align = "v", ncol = 1, rel_heights = c(0.8, 0.2))
+# Too many points to export as a PDF.
+ggsave("visuals/calibration-stacked-zoom-0.1.png", width = 6, height = 4, dpi = 300)
+
+
+#######################
+
+# Zoom in: 0.05 span
+ggplot(data = df, aes(x = pred, y = smooth_0.05)) + 
+  geom_line() + theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  lims(y = c(0, 0.1), x = c(0, 0.1)) +
+  labs(x = "Predicted risk", y = "Observed risk")
+ggsave("visuals/calibration-plot-cvsl-precalc-0.05-zoom.png")
+
+# Zoom in: 0.1 span
+ggplot(data = df, aes(x = pred, y = smooth_0.1)) + 
+  geom_line() + theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  lims(y = c(0, 0.1), x = c(0, 0.1)) +
+  labs(x = "Predicted risk", y = "Observed risk")
+
+ggplot(data = df, aes(x = pred, y = smooth_0.2)) + 
+  geom_line() + theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  lims(y = c(0, 0.1), x = c(0, 0.1)) +
+  geom_vline(xintercept = c(0.005, 0.01, 0.02), color = "blue", alpha = 0.5) +
+  labs(x = "Predicted risk", y = "Observed risk")
+ggsave("visuals/calibration-plot-cvsl-precalc-0.2-zoom.png")
+
+library(ggrepel)
+
+ggplot(data = df, aes(x = pred, y = smooth_0.2)) + 
+  geom_line() + theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  lims(y = c(0, 0.06), x = c(0, 0.05)) +
+  geom_vline(xintercept = c(0.005, 0.01, 0.02), color = "blue", alpha = 0.5) +
+  geom_label_repel(data = label_df,
+                   aes(x = x, y = y, label = label),
+                   nudge_x = 0, na.rm = TRUE) + 
+  labs(x = "Predicted risk", y = "Observed risk")
+ggsave("visuals/calibration-plot-cvsl-precalc-0.2-zoom2.png")
+
+(cal_tab = df %>% group_by(decile) %>%
+  summarize(n = scales::comma(n()),
+            pred_risk = mean(pred),
+            actual_risk = mean(y),
+            pred_over_actual = scales::number(pred_risk / actual_risk, accuracy = 0.01),
+            pred_minus_actual = scales::percent(pred_risk - actual_risk, accuracy = 0.001)) %>%
+  mutate(pred_risk = scales::percent(pred_risk, accuracy = 0.001),
+         actual_risk = scales::percent(actual_risk, accuracy = 0.001)) %>%
+  as.data.frame())
+
+#qplot(cal_tab$decile, cal_tab$actual_risk) + theme_minimal() + 
+#  labs(x = "Decile of predicted risk",
+#       y = "Actual risk")
+
+names(cal_tab) = c("Decile", "N", "Predicted risk", "Observed risk",
+                   "Predicted / Actual", "Predicted - Actual")
+
+kable(cal_tab, digits = 4)
+cat(kable(cal_tab, digits = 4))
+
+cat(kable(cal_tab, digits = 4, format = "latex",
+          align = "c",
+          booktabs = TRUE),
+    file = "tables/calibration-table.tex")
+
+# Mean absolute error: 0.14%
+mean(abs(df$smooth_0.2 - df$pred))
+# MAE: 0.19% with less smoothing
+mean(abs(df$smooth_0.05 - df$pred))
+
+# Root mean squared error: 0.000008%
+mean((df$smooth_0.2 - df$pred)^2)
+
+(cal_tab2 = df %>% group_by(vigintile) %>%
+  summarize(pred_risk = mean(pred),
+            actual_risk = mean(y),
+            pred_over_actual = pred_risk / actual_risk,
+            pred_minus_actual = pred_risk - actual_risk))
+
+qplot(cal_tab2$vigintile, cal_tab2$actual_risk) + theme_minimal() + 
+  labs(x = "Vigintile of predicted risk",
+       y = "Actual risk") #+
+#  geom_smooth()
+
+
+# Calibration analysis.
+reg = lm(smooth_0.1 ~ pred, data = df)
+summary(reg)
+
+# Plot recalibrated prediction.
+df$recalib_0.1 = reg$fitted.values
+ggplot(data = df, aes(x = recalib_0.1, y = smooth_0.05)) + 
+  # loess version.
+  geom_line() + theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  lims(y = c(0, 0.65)) +
+  labs(x = "Predicted risk (calibrated)", y = "Observed risk")
+
+# How much does the average prediction change after recalibration?
+# RMSE of 0.12%
+with(df, sqrt(mean((recalib_0.1 - pred)^2)))
+# MAE of 0.11%
+with(df, mean(abs(recalib_0.1 - pred)))
+
+# Transform Y so that coefficient is expected to be 0.
+df$y_trans_0.1 = df$smooth_0.1 - df$pred
+reg2 = lm(y_trans_0.1 ~ pred, data = df)
+# Std errors are the same but t-stat is much lower.
+summary(reg2)
+
+
+# Test for weak calibration:
+# Intercept should be close to 0.
+# Coefficient should be close to 1.
+
+```

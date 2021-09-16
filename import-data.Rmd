@@ -1,0 +1,1732 @@
+---
+title: "Import data"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("R/_startup.R")
+startup(auto_install = FALSE, verbose = FALSE)
+ck37r::load_all_code("R", verbose = TRUE)
+
+conf = list(verbose = TRUE)
+# rio::install_formats()
+```
+
+## Import raw data
+
+```{r import_raw_data}
+
+################
+# Main data file.
+
+
+
+# Real import:
+#(data_file = paste0(raw_dir, "data_grace.sas7bdat"))
+#(data_file = paste0(raw_dir, "data_grace2.sas7bdat"))
+(data_file = paste0(raw_dir, "data_grace3.sas7bdat"))
+stopifnot(file.exists(data_file))
+data = rio::import(data_file)
+
+# 137,273 observations and 66 columns.
+# This includes ineligible observations, so we will want to exclude them.
+dim(data)
+
+# This will cause RStudio to crash if Markdown output is displayed inline.
+(names(data) = tolower(names(data)))
+
+eligible = (is.na(data$trop_peak) | data$trop_peak <= 0.04) &
+           # no missingness for ed_adv_event
+           data$ed_adv_event == 0
+
+table(eligible, useNA = "ifany")
+
+exclude = (!is.na(data$trop_peak) & data$trop_peak > 0.04) | data$ed_adv_event == 1
+table(exclude, useNA = "ifany")
+table(exclude, eligible, useNA = "ifany")
+
+summary(data$trop3hv)
+summary(data$trop_peak)
+head(sort(data$trop_peak, decreasing = TRUE), n = 500)
+# 18k have troponin_peak > 0.04
+sum(data$trop_peak > 0.04, na.rm = TRUE)
+table(data$ed_adv_event, useNA = "ifany")
+names(data)
+
+class(data$tropc_peak)
+table(data$tropc_peak)
+
+# Recode tropc_peak to be in reverse order.
+# NOTE: any 1's in our original dataset will be excluded later in this chunk,
+# But we proceed with the recoding for posterity/safety.
+# Original tropc_peak codes per Jie's email on 9/24/2018:
+# "(1 >0.04, 2 0.02-0.04 and 3 <0.02)"
+tropc_new = dplyr::recode(data$tropc_peak,
+                          `3` = 1,
+                          `2` = 2,
+                          `1` = 3)
+
+# Confirm it looks good.
+table("original" = data$tropc_peak, "recoded" = tropc_new, useNA = "ifany")
+
+# Update in dataframe.
+data$tropc_peak = tropc_new
+
+# Exclude trop3hv > 0.04 or MACE dx in ED
+data = data[eligible, ]
+# 118,822 rows.
+nrow(data)
+
+summary(data$trop3hv)
+
+table(data$ed_adv_event, useNA = "ifany")
+
+# Now remove $ed_adv_event because it's only needed for eligibility.
+data$ed_adv_event = NULL
+
+```
+
+### Race, GFR, BMI
+
+```{r race_gfr_bmi}
+
+
+################
+# Race export
+data_file = paste0(raw_dir, "_outrace.sas7bdat")
+
+race = rio::import(data_file)
+dim(race)
+names(race) = tolower(names(race))
+table(race$race)
+race$race = factor(race$race)
+
+################
+# GFR export
+data_file = paste0(raw_dir, "_outgfr.sas7bdat")
+
+gfr = rio::import(data_file)
+names(gfr) = tolower(names(gfr))
+colnames(gfr)[2] = "gfr"
+names(gfr)
+table(gfr$name)
+gfr$group_race = ifelse(gfr$name == "GLOMERULAR FILTRATION RATE - AFRICAN AMERICAN",
+                        "black",
+                        "non_black")
+head(gfr, n = 7)
+
+# Remove duplicate rows.
+nrow(gfr)
+gfr = unique(gfr)
+# Down to 218,420 rows.
+nrow(gfr)
+
+
+# Clean up GFR value.
+gfr$gfr[gfr$gfr %in% c("SEE NOTE", "TND", "xxxxxx", "xxxxxxx")] = NA
+
+table(gfr$gfr, useNA = "ifany")
+
+gfr$gfr[gfr$gfr == ">60"] = "70"
+
+gfr$gfr = as.numeric(gfr$gfr)
+
+summary(gfr$gfr, useNA = "ifany")
+
+# Don't need this column anymore.
+gfr$name = NULL
+
+# TEMP: select first record per patient+race combination, if multiple exist.
+# Or could take the mean.
+library(dplyr)
+gfr = gfr %>% group_by(pat_enc_csn_id, group_race) %>% mutate(gfr = mean(gfr, na.rm = TRUE)) %>%
+  filter(row_number() == 1) %>% ungroup()
+# 217,212
+dim(gfr)
+head(gfr)
+
+# Convert from long to wide - will have two measurements per patient.
+gfr_wide = tidyr::spread(gfr, group_race, gfr)
+colnames(gfr_wide)[2:3] = c("gfr_black", "gfr_nonblack")
+head(gfr_wide)
+
+##################
+## BMI: exported 2018-06-29
+data_file = paste0(raw_dir, "_outbmi.sas7bdat")
+bmi = rio::import(data_file)
+names(bmi) = tolower(names(bmi))
+
+# This will warn about NAs introduced by coercion.
+bmi$bmi_raw = as.numeric(bmi$bmi_raw)
+
+# Some values are strange: min is 0.15 (too low) and high is 6328 (too high).
+summary(bmi)
+
+# Review the extremely high values.
+head(bmi$bmi_raw[order(bmi$bmi_raw, decreasing = TRUE)], n = 20)
+
+# Replace extremely high values with NAs.
+bmi$bmi_raw[bmi$bmi_raw > 350] = NA
+
+# Review the extremely low values.
+head(bmi$bmi_raw[order(bmi$bmi_raw)], n = 20)
+
+# Replace extremely low values with NAs.
+bmi$bmi_raw[bmi$bmi_raw < 1] = NA
+
+summary(bmi$bmi_raw, useNA = "ifany")
+qplot(bmi$bmi_raw) + xlim(15, 60)
+qplot(log(bmi$bmi_raw)) + xlim(2.5, 4.5)
+qplot(sqrt(bmi$bmi_raw)) + xlim(3.5, 8.5)
+
+# Check for duplication by patient - nope.
+anyDuplicated(bmi$pat_enc_csn_id)
+
+```
+
+### A1c lipids
+
+
+```{r a1c_lipids}
+
+##################
+## A1C: exported 2018-06-29
+## A1C, HDL, LDL, triglycerides: exported 2018-09-24
+#data_file = paste0(raw_dir, "_outa1c.sas7bdat")
+data_file = paste0(raw_dir, "_lab_vdw.sas7bdat")
+extra = rio::import(data_file)
+(names(extra) = tolower(names(extra)))
+
+# This is a column to show which measurement exists.
+extra$test_type = tolower(extra$test_type)
+table(extra$test_type)
+
+# Lab_dt is already set as a date.
+class(extra$lab_dt)
+
+# Remove MRN, not used for joins.
+extra$mrn = NULL
+
+dim(extra)
+
+# Group by patient and measurement.
+extra2 = extra %>% group_by(pat_enc_csn_id, test_type) %>%
+  arrange(desc(lab_dt)) %>%
+  # We no longer need lab date or time - those are test-specific.
+  select(-c(adt_arrival_time, lab_dt, lab_tm)) %>%
+  filter(row_number() == 1) %>% ungroup() %>% as.data.frame()
+
+dim(extra2)
+
+# Sort by date and take the latest measurement for each patient.
+
+# Convert from long to wide.
+extra_wide = tidyr::spread(extra2, key = test_type, value = result_c)
+
+# 108,265 records.
+dim(extra_wide)
+
+
+extra_wide$hdl = as.integer(extra_wide$hdl)
+extra_wide$hgba1c = as.numeric(extra_wide$hgba1c)
+extra_wide$ldl_clc_ns = as.numeric(extra_wide$ldl_clc_ns)
+extra_wide$ldl_direct = as.integer(extra_wide$ldl_direct)
+extra_wide$tot_choles = as.integer(extra_wide$tot_choles)
+# Take log of triglycerides
+extra_wide$log_trigl_ns = log(as.integer(extra_wide$trigl_ns))
+# Remove old version.
+extra_wide$trigl_ns = NULL
+
+summary(extra_wide)
+
+
+```
+
+### MACE Plus (60 days)
+
+```{r mace_plus}
+(data_file = paste0(raw_dir, "chestpaindata.sas7bdat"))
+mace_plus = rio::import(data_file)
+names(mace_plus) = tolower(names(mace_plus))
+names(mace_plus)
+
+# Just select patient ID and MACE-plus outcome.
+mace_plus = mace_plus %>% select(pat_enc_csn_id, ads60pd)
+```
+
+```{r data_merge}
+
+################
+# Combine files
+
+# Merge in race
+data = dplyr::left_join(data, race, by = "pat_enc_csn_id")
+table(data$race, useNA = "ifany")
+dim(data)
+
+# Merge in gfr
+data = dplyr::left_join(data, gfr_wide, by = "pat_enc_csn_id")
+dim(data)
+
+# Create single gfr column
+table(data$race)
+data$gfr = ifelse(data$race == "2 Black", data$gfr_black, data$gfr_nonblack)
+data$gfr_black = NULL
+data$gfr_nonblack = NULL
+summary(data$gfr)
+qplot(data$gfr)
+
+# WE have 91k healthy GFRs (> 60), 17k non-healthy, and 11k missing.
+(tab = table("gfr70" = data$gfr == 70, "is.na" = is.na(data$gfr), useNA = "ifany"))
+prop.table(tab)
+
+# Merge in BMI
+data = dplyr::left_join(data, bmi, by = "pat_enc_csn_id")
+dim(data)
+
+# Merge in A1c_lipid info
+data = dplyr::left_join(data, extra_wide, by = "pat_enc_csn_id")
+dim(data)
+
+# Merge in MACE-plus outcome.
+data = dplyr::left_join(data, mace_plus, by = "pat_enc_csn_id")
+dim(data)
+
+```
+
+## Improve variable names
+
+```{r data_rename}
+names(data)
+class(data)
+
+data = data %>%
+  rename(pain_palpat = palpat,
+         pain_inspir = insp,
+         exertion = exert,
+         pain_sharp = sharp,
+         pain_radiate = rad,
+         aortic_athero = aa,
+         coronary_rev = crev,
+         stroke = stk,
+         kidney_gfr = gfr,
+         pulse = pulse,
+         diaphoresis = diapho,
+         # Treadmill
+         tread_before = thread_before,
+         myo_infarc = mi)
+names(data)
+
+# Review value distribution for these variables which may get special imputation.
+table(data$pain_sharp, useNA = "ifany")
+table(data$pain_inspir, useNA = "ifany")
+table(data$pain_radiate, useNA = "ifany")
+table(data$pain_palpat, useNA = "ifany")
+table(data$exertion, useNA = "ifany")
+table(data$diaphoresis, useNA = "ifany")
+
+summary(data)
+
+```
+
+## Recoding
+
+### Fix CAD history
+
+```{r recode_cad}
+
+## Fix cad history for individuals who have had revascularization.
+table("coronary_rev" = data$coronary_rev, "cad" = data$cad, useNA = "ifany")
+
+# Individuals with a history of coronary revscularization should have cad = 1
+bad_cad = data$cad == 0 & data$coronary_rev == 1
+table(bad_cad, "cad" = data$cad)
+data$cad[bad_cad] = 1L
+
+table("coronary_rev" = data$coronary_rev, "cad" = data$cad, useNA = "ifany")
+```
+
+### Combine LDL variables
+
+```{r recode_ldl}
+# If direct is missing, substitute calculated
+# Create ldl source variable.
+summary(data$ldl_clc_ns)
+summary(data$ldl_direct)
+data$ldl = data$ldl_direct
+data$ldl[is.na(data$ldl_direct)] = data$ldl_clc_ns[is.na(data$ldl_direct)]
+summary(data$ldl)
+```
+
+## Define data structure
+
+```{r data_structure}
+
+# Variables to exclude
+vars = list(
+  exclude = c("pat_enc_csn_id",
+              # No longer in export.
+              # "patient_mrn",
+              "adt_arrival_time",
+              "index_outcome",
+              # These are all recorded after the index date.
+              "thread_after",
+              "ct_after",
+              "mpi_after",
+              "cath_after",
+              "echo_after",
+              # Combined into the "ldl" variable.
+              "ldl_direct",
+              "ldl_clc_ns",
+              NULL),
+  outcomes = c(
+    #### 60-day outcomes  ####
+    # MACE 60-day - defined by dx and death.
+    "ads60d",
+    "pci_60d", # Revascularization - PCI (Percutaneous Coronary Intervention aka "angioplasty with stent")
+    "cabg_60d", # Revascularization - CABG (Coronary Artery Bypass Grafting, "cabbage")
+    "pamis_60d", # AMI?
+    "pcardia_60d", #  
+    "pcs_60d",   # Precordial catch syndrome?
+    "death_60d", # Mortality
+    "ads60pd",
+    # 30-day outcomes
+    "ads30d", "pamis_30d", "pcardia_30d", "pcs_30d", "pci_30d", "cabg_30d",
+    "death_30d"),
+  # These will be defined in the next line of
+  covariates = NULL
+)
+
+# Update some of these outcomes to be 0 rather than NA.
+update_outcomes = c("pamis_60d", "pcs_60d", "pcardia_60d", "death_60d")
+#$ pamis_60d | pcardia_60d | pcs_60d | death_60d)
+for (var_i in update_outcomes) {
+  cat("Processing", var_i, "\n")
+  
+  if (!var_i %in% names(data)) {
+    stop(paste0("Cannot find", var_i, "in data."))
+  }
+  print(table(data[[var_i]], useNA = "ifany"))
+  # Update NAs to instead be 0's, to facilitate logical testing.
+  data[is.na(data[[var_i]]), var_i] = 0
+  print(table(data[[var_i]], useNA = "ifany"))
+}
+
+(vars$covariates = setdiff(names(data), c(vars$exclude, vars$outcomes)))
+
+if (F) {
+  # Note that we do have some missing values.
+  summary(data[vars$covariates])
+}
+
+# Very rare outcome - only 2,307 positive and 116.5k negative.
+summary(data[[vars$outcomes[1]]])
+table(data[[vars$outcomes[1]]])
+# 1.9% positive
+prop.table(table(data[[vars$outcome[1]]]))
+
+vars$outcomes
+
+# Check secondary outcome (60d MACE-Plus)
+summary(data$ads60pd)
+table(data$ads60pd) 
+prop.table(table(data$ads60pd, useNA = "ifany")) # 3.7%
+```
+
+## Computed outcomes
+
+```{r outcomes_computed}
+# 60d MACE created from the underlying components.
+data$ads60d_replication = with(data, as.integer(pamis_60d | pcardia_60d | pcs_60d | death_60d))
+
+# Successfully shows 2,307 for both approaches.
+table("60d" = data$ads60d, "rep" = data$ads60d_replication, useNA = "ifany")
+
+# Now remove since we've shown we can use the outcome components correctly.
+data$ads60d_replication = NULL
+
+# 60d MACE without death
+data$ads60d_nomort = with(data, as.integer(pamis_60d | pcardia_60d | pcs_60d))
+# Wrong definition (see email thread with DUstin Mark)
+#data$ads60d_nomort = with(data, as.integer(ads60d & !death_60d))
+table("nomort" = data$ads60d_nomort, "ads60d" = data$ads60d, useNA = "ifany")
+# 1.2% positive - 1,454 records.
+prop.table(table(data$ads60d_nomort, useNA = "ifany"))
+
+# 30d MACE without death
+data$ads30d_nomort = with(data, as.integer(ads30d & !death_30d))
+table(data$ads30d_nomort, data$ads30d, useNA = "ifany")
+# 1.0% positive - 1,145 records.
+prop.table(table(data$ads30d_nomort, useNA = "ifany"))
+
+# Replicate 60d MACE-Plus first.
+data$ads60pd_replication = with(data,
+                                as.integer(pamis_60d | pcardia_60d | pcs_60d | cabg_60d | pci_60d | death_60d))
+
+# 4,385 for both - successful replication.
+table("60pd" = data$ads60pd, "rep" = data$ads60pd_replication, useNA = "ifany")
+
+# Now remove after we've confirmed the replication.
+data$ads60pd_replication = NULL
+
+# 60d MACE plus without death
+#data$ads60pd_nomort = with(data, as.integer(pamis_60d | pcardia_60d | pcs_60d))
+data$ads60pd_nomort = with(data, as.integer(pamis_60d | pcardia_60d | pcs_60d | cabg_60d | pci_60d))
+table("nomort" = data$ads60pd_nomort, "ads60pd" = data$ads60pd, useNA = "ifany")
+# 3.0% positive - 3,535 records.
+prop.table(table(data$ads60pd_nomort, useNA = "ifany"))
+
+(vars$outcomes = c(vars$outcomes, "ads60d_nomort", "ads30d_nomort", "ads60pd_nomort"))
+```
+
+## Examine missing value distribution
+
+```{r examine_missingness}
+# Look at missingness among covariates.
+missing = is.na(data[, vars$covariates])
+
+missing_df =
+  data.frame(var = colnames(missing),
+             missing_mean = colMeans(missing),
+             missing_count = colSums(missing)) %>%
+  filter(missing_count > 0) %>% arrange(desc(missing_mean))
+
+missing_df
+
+missing_df$missing_mean = paste0(round(missing_df$missing_mean * 100, 1), "%")
+missing_df$missing_count = prettyNum(missing_df$missing_count, big.mark = ",")
+
+colnames(missing_df) = c("Variable", "Missing rate", "Missing values")
+
+(kab_table = kable(missing_df, format = "latex", digits = c(0, 3, 0),
+                   booktabs = TRUE))
+cat(kab_table %>% kable_styling(latex_options = "striped"),
+    file = "tables/missingness-table.tex")
+
+
+# Correlation table of missingness
+# Only examine variables with missingness > 0%.
+missing2 = is.na(data[, as.character(missing_df$Variable)])
+
+colMeans(missing2)
+
+cor(missing2)
+
+# Correlation matrix of missingness.
+(missing_cor = cor(missing2))
+
+# Replace the unit diagonal with NAs so that it doesn't show as yellow.
+diag(missing_cor) = NA
+
+# Heatmap of correlation table.
+png("visuals/missingness-superheat.png", height = 600, width = 900)
+superheat::superheat(missing_cor,
+          # change the angle of the label text
+          bottom.label.text.angle = 90,
+          pretty.order.rows = TRUE,
+          pretty.order.cols = TRUE,
+          row.dendrogram = TRUE,
+          scale = FALSE)
+dev.off()
+
+
+# Table with count of missing covariates by observation.
+missing_counts = rowSums(missing2)
+table(missing_counts)
+# Typical observation is missing 6 covariates.
+summary(missing_counts)
+
+# Code from:
+# https://stackoverflow.com/questions/27850123/ggplot2-have-shorter-tick-marks-for-tick-marks-without-labels?noredirect=1&lq=1
+
+# Major tick marks
+major = 5000
+
+# Minor tick marks
+minor = 1000
+
+# Range of x values
+# Ensure that we always start at 0.
+(range = c(0, 2* minor + sum(missing_counts == as.integer(names(which.max(table(missing_counts)))))))
+
+
+
+# Function to insert blank labels
+# Borrowed from https://stackoverflow.com/questions/14490071/adding-minor-tick-marks-to-the-x-axis-in-ggplot2-with-no-labels/14490652#14490652
+insert_minor <- function(major, n_minor) {
+      labs <- c(sapply(major, function(x, y) c(x, rep("", y) ), y = round(n_minor)))
+      labs[1:(length(labs) - n_minor)]
+}
+
+# Getting the 'breaks' and 'labels' for the ggplot
+n_minor = major / minor - 1
+(breaks = seq(min(range), max(range), minor))
+(labels = insert_minor(seq(min(range), max(range), major), n_minor))
+if (length(breaks) > length(labels)) labels = c(labels, rep("", length(breaks) - length(labels)))
+
+
+ggplot(data.frame(missing_counts), aes(x = missing_counts)) +
+  geom_bar(aes(y = ..count..)) +
+  theme_minimal() +
+  geom_text(aes(label = scales::percent(..prop..), y = ..count..),
+             stat = "count", hjust = -0.2, size = 3, nudge_x = 0.05,
+            color = "gray30",
+            NULL) + 
+  scale_x_continuous(breaks = seq(0, max(table(missing_counts)))) +
+  scale_y_continuous(breaks = breaks,
+                     labels = ifelse(labels != "", prettyNum(labels, big.mark = ",", preserve.width = "none"), ""),
+                     limits = c(0, max(range))) +
+  labs(title = "Distribution of number of missing covariates",
+       x = "Number of covariates that are missing",
+       y = "Count of observations in dataset") +
+  # TODO: remove grid axes, add gray background.
+  # Label each value on x axis.
+  theme(panel.grid = element_blank(),
+        axis.ticks.x = element_line(color = "gray60", size = 0.5),
+        panel.background = element_rect(fill = "white", color = "gray50"),
+        plot.background = element_rect(fill = "gray95")) +
+  coord_flip()
+ggsave("visuals/missing-count-hist.png", width = 8, height = 4)
+
+# 17 variables with missingness
+ncol(missing2)
+```
+
+## Exclude patients missing smoking
+
+```{r exclude_missing_smoking}
+nrow(data)
+data = subset(data, subset = !is.na(smoking))
+nrow(data)
+```
+
+## Remove constant columns 
+
+We don't have any constant columns but good to confirm.
+
+```{r remove_constants}
+
+# Count the unique values in each covariate, excluding NAs.
+unique_vals = sapply(data[, vars$covariates, drop = FALSE],
+                     function(col_vals) length(setdiff(unique(col_vals), NA)))
+
+# Looks good, no constant columns.
+summary(unique_vals)
+
+# Remove constant columns from the covariate file.
+constant_columns = vars$covariates[unique_vals < 2L]
+  
+if (length(constant_columns) > 0L) {
+  data = data[, !names(data) %in% constant_columns, drop = FALSE]
+  vars$covariates = setdiff(vars$covariates, constant_columns)
+}
+  
+if (conf$verbose) {
+  cat("Removed", length(constant_columns), "constant columns from the covariate file.\n")
+}
+  
+rm(constant_columns)
+```
+
+## Extreme value review
+
+```{r extreme_values}
+# BMI
+
+(max_bmi = data %>% select(bmi_raw) %>% arrange(desc(bmi_raw)) %>% head(300) %>% as.data.frame())
+
+qplot(max_bmi$bmi_raw) + theme_minimal() +
+  labs(x = "Body mass index",
+       title = "Patients with highest BMI that is < 350",
+       subtitle = "Highest 300 values; median = 29, mean = 30") +
+  geom_vline(xintercept = 69, color = "red") +
+  annotate("text", label = "99.9 percentile = 69", x = 130, y = 130, color = "red")
+ggsave("visuals/outliers-bmi-max.png")
+
+# Add BMI high-cutoff of 100
+data$bmi_raw[!is.na(data$bmi_raw) & data$bmi_raw > 100] = NA
+
+# And low-cutoff of 10.
+data$bmi_raw[!is.na(data$bmi_raw) & data$bmi_raw < 10] = NA
+
+summary(data$bmi_raw)
+
+# Oxygen saturation
+
+(mins_sat = data %>% select(sat) %>% arrange(sat) %>% head(300) %>% as.data.frame())
+
+qplot(mins_sat$sat) + theme_minimal() +
+  labs(x = "Oxygen saturation",
+       title = "Patients with lowest oxygen saturation",
+       subtitle = "Lowest 300 values; median & mean = 98") +
+  geom_vline(xintercept = 81, color = "red") +
+  annotate("text", label = "0.1 percentile = 81", x = 63, y = 60, color = "red")
+ggsave("visuals/outliers-sat-min.png")
+
+# Add oxygen low-cutoff of 11
+data$sat[!is.na(data$sat) & data$sat < 11] = NA
+
+summary(data$sat)
+```
+
+
+## Summarize predictors
+
+We will use this to support:
+
+  * Review by the team, such as to identify additional cleaning of outliers
+  * To inform the loss functions used for GLRM interpretation, and
+  * As a possible table in the manuscript (supplemental info most likely).
+
+```{r predictor_summary}
+# Columns: variable name, type, # of unique values, mode, mean, median, min, max, missingness
+
+# Groups: demographic, biomarker, notes, score, clinical history (including family)
+vars$groups = list(
+  demo = c("age", "male", "race"),
+  score = c("edacs", "heart", "edacs_high", "heart_high"),
+  history = c("fam_hx_pre_cad", "hypercho", "htn", "dm", "cad", "coronary_rev",
+              "myo_infarc", "stroke", "apd", "aortic_athero", "pad", "pre_dm",
+              "anxiety", "smoking", "tread_before", "ct_before", "mpi_before",
+              "cath_before", "echo_before", "utl_before"),
+  notes = c("diaphoresis", "pain_inspir", "exertion", "pain_sharp", "pain_radiate",
+                "pain_palpat"),
+  vitals = c("bmi_raw", "obesity", "pulse", "pulse_peak", "resp", "sat", "sbp", "sbp_lowest"),
+  labs = c("hdl", "hgba1c", "kidney_gfr", "ldl", "log_trigl_ns", "tot_choles"))
+
+# Everything else is grouped as a biomarker.
+vars$groups$biomarker = setdiff(vars$covariates, unlist(unname(vars$groups)))
+
+# Manually code certain numerics to be integers.
+vars$integers = c("age", "pulse", "sbp", "resp", "sat", "edacs", "heart", "pulse_peak",
+                 "sbp_lowest", "hdl", "tot_choles", "ldl")
+
+(vars$ordinal = c("ecg_score", vars$covariates[vars$covariates %in% vars$groups$notes]))
+
+vars
+
+
+summarize_predictors =
+  function(df,
+           covars,
+           groups,
+           integers = NULL,
+           ordinal = NULL) {
+
+  var_df = data.frame(matrix(nrow = length(covars),
+                             ncol = 13L))
+  names(var_df) = c("var", "group", "class", "type", "uniq_vals", "mode", "mean", "median", "min", "pctile_0.1", "max", "pctile_99.9", "missingness")
+  
+
+  var_df$var = covars
+  var_df$class = sapply(df[, covars], class)
+  var_df$mode = sapply(df[, covars], function(var) ck37r::Mode(var)[1])
+  # Don't count NAs as a unique value.
+  var_df$uniq_vals = sapply(df[, covars], function(var) length(setdiff(unique(var), NA)))
+
+  summary_stats = lapply(df[, covars], function(var) {
+    summ = summary(var)
+    var_cdf = ecdf(var)
+    summ["pctile_99.9"] = quantile(var_cdf, 0.999)
+    summ["pctile_0.1"] = quantile(var_cdf, 0.001)
+    
+    summ
+  })
+
+  var_df$mean = sapply(summary_stats, `[`, "Mean")
+  var_df$min = sapply(summary_stats, `[`, "Min.")
+  var_df$max = sapply(summary_stats, `[`, "Max.")
+  var_df$median = sapply(summary_stats, `[`, "Median")
+  
+  var_df$pctile_99.9 = sapply(summary_stats, `[`, "pctile_99.9")
+  var_df$pctile_0.1 = sapply(summary_stats, `[`, "pctile_0.1")
+  
+  var_df$missingness = colMeans(is.na(df[, covars]))
+  
+
+  for (group in names(groups)) {
+    var_df$group[var_df$var %in% groups[[group]]] = group
+  }
+  
+  # Factor variables are category.
+  var_df$type[var_df$class == "factor"] = "categorical"
+  
+  # Programatically identify binary vars.
+  binary_vars = var_df$class %in% c("numeric", "integer", "boolean") &
+    var_df$min == 0 & var_df$max == 1 & var_df$uniq_vals == 2
+  
+  # Recode binary vars to integers.
+  for (binary_var in vars$covariates[binary_vars]) {
+    df[[binary_var]] = as.integer(df[[binary_var]])
+  }
+  
+  # Update type
+  var_df$type[binary_vars] = "binary"
+
+  for (integer_var in integers) {
+    df[[integer_var]] = as.integer(df[[integer_var]])
+  }
+  
+  # These are all positive integers
+  var_df$type[var_df$var %in% integers] = "pos. int."
+  
+  for (ordinal_var in ordinal) {
+    df[[ordinal_var]] = as.integer(df[[ordinal_var]])
+  }
+  
+  # These are all nonnegative integers
+  var_df$type[var_df$var %in% ordinal] = "ordinal int."
+
+  # Update class
+  var_df$class = sapply(df[, covars], class)
+
+  # Review numerics with few unique vals.
+  few_unique_vals = var_df$class == "numeric" & var_df$uniq_vals <= 10
+
+  for (var in var_df$var[few_unique_vals]) {
+    cat("Var:", var, "\n")
+    print(table(df[[var]], useNA = "ifany"))
+  }
+
+  # Make remaining numeric vars continuous type
+  var_df$type[var_df$class == "numeric" & is.na(var_df$type)] = "continuous"
+
+  # Sort by group and then variable name.
+  var_df = var_df %>% dplyr::arrange(group, var) %>% as.data.frame()
+  
+  result = list(data = df,
+                table = var_df)
+  
+  result
+}
+
+result = summarize_predictors(data, vars$covariates, vars$groups, vars$integers, vars$ordinal)
+
+# Export as a spreadsheet
+rio::export(result$table, file = "tables/predictor-summary.xlsx", overwrite = TRUE)
+
+var_df = result$table
+data = result$data
+
+```
+
+## Load descriptive variable names
+
+Based on editing the predictor summary export. These will be merged later.
+
+```{r load_var_names}
+name_df = rio::import("data-raw/predictor-summary.xlsx", sheet = "names")
+name_df
+
+var_df
+```
+
+
+## Save unimputed version
+
+```{r save_unimputed}
+save(data, var_df, vars, name_df,
+     file = paste0(data_dir, "import-data.RData"))
+```
+
+## Re-analyze missing value distributions after missing-smoking obserations removed.
+
+```{r examine_missingness_v2}
+# Look at missingness among covariates.
+missing = is.na(data[, vars$covariates])
+
+missing_df =
+  data.frame(var = colnames(missing),
+             missing_mean = colMeans(missing),
+             missing_count = colSums(missing)) %>%
+  filter(missing_count > 0) %>% arrange(desc(missing_mean))
+
+missing_df
+
+missing_df$missing_mean = paste0(round(missing_df$missing_mean * 100, 1), "%")
+missing_df$missing_count = prettyNum(missing_df$missing_count, big.mark = ",")
+
+colnames(missing_df) = c("Variable", "Missing rate", "Missing values")
+
+(kab_table = kable(missing_df, format = "latex", digits = c(0, 3, 0),
+                   booktabs = TRUE))
+cat(kab_table %>% kable_styling(latex_options = "striped"),
+    file = "tables/missingness-table-v2.tex")
+
+
+# Correlation table of missingness
+# Only examine variables with missingness > 0%.
+missing2 = is.na(data[, as.character(missing_df$Variable)])
+
+colMeans(missing2)
+
+cor(missing2)
+
+# Correlation matrix of missingness.
+(missing_cor = cor(missing2))
+
+# Replace the unit diagonal with NAs so that it doesn't show as yellow.
+diag(missing_cor) = NA
+
+# Heatmap of correlation table.
+png("visuals/missingness-superheat-v2.png", height = 600, width = 900)
+superheat::superheat(missing_cor,
+          # change the angle of the label text
+          bottom.label.text.angle = 90,
+          pretty.order.rows = TRUE,
+          pretty.order.cols = TRUE,
+          row.dendrogram = TRUE,
+          scale = FALSE)
+dev.off()
+
+
+# Table with count of missing covariates by observation.
+missing_counts = rowSums(missing2)
+table(missing_counts)
+# Typical observation is missing 6 covariates.
+summary(missing_counts)
+
+# Code from:
+# https://stackoverflow.com/questions/27850123/ggplot2-have-shorter-tick-marks-for-tick-marks-without-labels?noredirect=1&lq=1
+
+# Major tick marks
+major = 5000
+
+# Minor tick marks
+minor = 1000
+
+# Range of x values
+# Ensure that we always start at 0.
+(range = c(0, 2* minor + sum(missing_counts == as.integer(names(which.max(table(missing_counts)))))))
+
+
+
+# Function to insert blank labels
+# Borrowed from https://stackoverflow.com/questions/14490071/adding-minor-tick-marks-to-the-x-axis-in-ggplot2-with-no-labels/14490652#14490652
+insert_minor <- function(major, n_minor) {
+      labs <- c(sapply(major, function(x, y) c(x, rep("", y) ), y = round(n_minor)))
+      labs[1:(length(labs) - n_minor)]
+}
+
+# Getting the 'breaks' and 'labels' for the ggplot
+n_minor = major / minor - 1
+(breaks = seq(min(range), max(range), minor))
+(labels = insert_minor(seq(min(range), max(range), major), n_minor))
+if (length(breaks) > length(labels)) labels = c(labels, rep("", length(breaks) - length(labels)))
+
+
+ggplot(data.frame(missing_counts), aes(x = missing_counts)) +
+  geom_bar(aes(y = ..count..)) +
+  theme_minimal() +
+  geom_text(aes(label = scales::percent(..prop..), y = ..count..),
+             stat = "count", hjust = -0.2, size = 3, nudge_x = 0.05,
+            color = "gray30") + 
+#  scale_x_continuous(breaks = seq(0, table(max(missing_counts)))) +
+  scale_x_continuous(breaks = seq(0, max(table(missing_counts)))) +
+  scale_y_continuous(breaks = breaks,
+                     labels = ifelse(labels != "", prettyNum(labels, big.mark = ",", preserve.width = "none"), ""),
+                     limits = c(0, max(range))) +
+  labs(title = "Distribution of number of missing covariates",
+       subtitle = "After unknown-smoking-status observations removed",
+       x = "Number of covariates that are missing",
+       y = "Count of observations in dataset") +
+  # TODO: remove grid axes, add gray background.
+  # Label each value on x axis.
+  theme(panel.grid = element_blank(),
+        axis.ticks.x = element_line(color = "gray60", size = 0.5),
+        panel.background = element_rect(fill = "white", color = "gray50"),
+        plot.background = element_rect(fill = "gray95")) +
+  coord_flip()
+ggsave("visuals/missing-count-hist-v2.png", width = 8, height = 4)
+
+# 16 variables with missingness
+ncol(missing2)
+```
+
+## Impute missing values
+
+```{r impute_missing_values}
+# Review missingness.
+colMeans(is.na(data[, vars$covariates]))
+
+# First create matrix of missingness indicators for all covariates.
+miss_inds =
+  ck37r::missingness_indicators(data,
+                                skip_vars = c(vars$exclude, vars$outcome),
+                                verbose = TRUE)
+colMeans(miss_inds)
+
+# Manually impute certain variables to 0 rather than use the sample median (or GLRM).
+impute_to_0_vars = c("diaphoresis", "pain_inspir", "exertion", "pain_sharp", "pain_radiate",
+                     "pain_palpat")
+
+# Review missingness one last time for these vars.
+colMeans(is.na(data[, impute_to_0_vars]))
+
+# Also review the median before we conduct imputation.
+summary(data[, impute_to_0_vars])
+
+# Impute these variables specifically to 0, rather than sample median (although
+# in many cases the median was already 0).
+data[, impute_to_0_vars] = lapply(data[, impute_to_0_vars], function(col) {
+  col[is.na(col)] = 0L
+  col
+})
+
+# Confirm we have no more missingness in these vars.
+colMeans(is.na(data[, impute_to_0_vars]))
+```
+
+### GLRM prep
+
+
+```{r glrm_prep}
+
+# Subset using var_df$var so that it's in the same order as var_df.
+impute_df = data[, var_df$var]
+
+# Convert binary variables to logical
+(binary_vars = var_df$var[var_df$type == "binary"])
+for (binary_name in binary_vars) {
+  impute_df[[binary_name]] = as.logical(impute_df[[binary_name]])
+}
+
+# NOTE: these will be turned into factor variables within h2o.
+table(sapply(impute_df, class))
+
+# Create a dataframe describing the loss function by variable; the first variable must have index = 0
+losses = data.frame("index" = seq(ncol(impute_df)) - 1,
+                    "feature" = var_df$var,
+                    "class" = var_df$class,
+                    "type" = var_df$type,
+                    stringsAsFactors = FALSE)
+
+
+# Update class for binary variables.
+for (binary_name in binary_vars) {
+  losses[var_df$var == binary_name, "class"] = class(impute_df[[binary_name]])
+}
+
+losses$loss[losses$class == "numeric"] = "Huber"
+
+losses$loss[losses$class == "integer"] = "Huber"
+
+losses$loss[losses$class == "factor"] = "Categorical"
+
+losses$loss[losses$type == "binary"] = "Hinge"
+# Logistic seems to yield worse reconstruction RMSE overall.
+#losses$loss[losses$type == "binary"] = "Logistic"
+
+# EDACS can be negative so convert to Huber (or Absolute).
+losses$loss[losses$feature == "edacs"] = "Huber"
+
+losses
+
+```
+
+### Start h2o
+
+```{r h2o_init}
+# We are avoiding library(h2o) due to namespace conflicts with dplyr & related packages.
+# Initialize h2o
+analyst_name = "chris-kennedy"
+h2o::h2o.no_progress()  # Turn off progress bars
+h2o::h2o.init(max_mem_size = "15g",
+              name = paste0(analyst_name, "-h2o"),
+              # Default port is 54321, but other analysts may be using that.
+              port = 54320,
+              # This can reduce accidental sharing of h2o processes on a shared server.
+              username = analyst_name,
+              password = paste0("pw-", analyst_name),
+              # Use half of available cores for h2o.
+              nthreads = get_cores())
+
+# Convert data to h2o object
+h2o_df = h2o::as.h2o(impute_df)
+(h2o_types = unlist(h2o::h2o.getTypes(h2o_df)))
+
+# Double-check side-by-side.
+cbind(losses, h2o_types)
+```
+
+### GLRM grid search (disabled currently)
+
+Follow hyperparameter optimization method shown at:
+  * https://github.com/h2oai/h2o-tutorials/blob/master/best-practices/glrm/GLRM-BestPractices.Rmd
+  * and https://bradleyboehmke.github.io/HOML/GLRM.html#tuning-to-optimize-for-unseen-data
+
+```{r glrm_grid_search, eval = FALSE}
+
+# Split data into train & validation
+split = h2o::h2o.splitFrame(h2o_df, ratios = 0.75, seed = 1)
+train = split[[1]]
+valid = split[[2]]
+
+val_df = as.data.frame(valid)
+
+exp(c(-0.7, -0.44, -0.3, -0.2, -0.14))
+
+round(exp(log(ncol(impute_df)) * c(0.5, 0.6, 0.7, 0.8, 0.9)))
+round(exp(log(ncol(impute_df)) * c(0.5, 0.64, 0.74, 0.81, 0.87)))
+
+# -0.7 refers to sqrt(ncol(df))
+round(exp(log(ncol(impute_df)) * exp(c(-0.7, -0.44, -0.3, -0.2, -0.14))))
+round(exp(log(ncol(impute_df)) * exp(c(-0.3, -0.2, -0.14, -0.1, -0.05))))
+seq(3, 21, by = 4L)
+log(ncol(impute_df))
+sqrt(ncol(impute_df))
+
+# Create hyperparameter search grid
+params = expand.grid(
+  #k = seq(3, 21, by = 2L),
+  #k = seq(3, 21, by = 3L),
+  
+  # Grids on k:
+  #k = seq(3, 21, by = 4L),
+  # k = round(exp(log(ncol(impute_df)) * exp(c(-0.7, -0.44, -0.3, -0.2, -0.14)))),
+  #k = round(exp(log(ncol(impute_df)) * exp(c(-0.3, -0.2, -0.14, -0.1, -0.05)))),
+  #k = round(exp(log(ncol(impute_df)) * exp(c(-0.1, -0.05, -0.02, 0)))),
+  k = c(46, 48, 50, 52, 54),
+  #regularization_x = c("None", "NonNegative", "L1"),
+  #regularization_x = c("None", "Quadratic", "L1"),
+  regularization_x = c("Quadratic"),
+  #regularization_y = c("None", "NonNegative", "L1"),
+  #regularization_y = c("None", "Quadratic", "L1"),
+  regularization_y = c("L1"),
+  #gamma_x = seq(0, 1, by = .25),
+  #gamma_y = seq(0, 1, by = .25),
+  # This gamma range is from:
+  # https://github.com/h2oai/h2o-tutorials/blob/master/best-practices/glrm/GLRM-BestPractices.Rmd
+  #gamma = seq(0, 5, by = 1),
+  #gamma = c(0, 0.25, 0.5, 1, 2),
+  #gamma_x = c(0, 0.5, 1, 2, 4),
+  #gamma_x = c(0, 1, 2, 4, 8, 16),
+  #gamma_x = c(2, 4, 8, 16, 24),
+  gamma_x = c(1, 2, 4, 8, 16),
+  #gamma_y = c(0, 0.5, 1, 2, 4),
+  #gamma_y = c(0, 1, 2, 4, 8, 16),
+  gamma_y = c(4, 8, 16, 24, 32),
+  error_num = NA,
+  error_cat = NA,
+  objective = NA,
+  stringsAsFactors = FALSE)
+
+# 125 combinations!
+dim(params)
+
+# Remove combinations in which regularization_x = None and gamma_x != 0
+params = subset(params, regularization_x != "None" | gamma_x == 0)
+
+# Remove combinations in which regularization_x != None and gamma_x == 0
+params = subset(params, regularization_x == "None" | gamma_x != 0)
+
+# Remove combinations in which regularization_y = None and gamma_y != 0
+params = subset(params, regularization_y != "None" | gamma_y == 0)
+
+# Remove combinations in which regularization_y != None and gamma_y == 0
+params = subset(params, regularization_y == "None" | gamma_y != 0)
+
+# No reduction in this end-stage grid.
+dim(params)
+
+params
+
+# Randomly order the params so that we can stop at any time.
+set.seed(1)
+params = params[sample(nrow(params)), ]
+params
+
+glrm_metrics = list()
+# Summary text
+glrm_sum = list()
+
+nrow(params)
+
+# Perform grid search
+# Took 3.2 hours on CNN-DCP-DOR-RC01 with 225 combinations
+# Should take 6-7 with  405 combinations
+system.time({
+for (i in seq_len(nrow(params))) {
+#for (i in 1:3) {
+  cat("Iteration", i, "of", nrow(params), "", paste0(round(i / nrow(params) * 100, 1), "%\n"))
+  print(params[i, ])
+  
+  # Create model
+  glrm_model = h2o::h2o.glrm(
+    training_frame = train,
+    # h2o requires that the validation frame have the same # of rows as the training data for some reason.
+    #validation_frame = valid,
+    #k = 10, 
+    k = params$k[i], 
+    loss = "Quadratic",
+    regularization_x = params$regularization_x[i], 
+    regularization_y = params$regularization_y[i],
+    gamma_x = params$gamma_x[i],
+    gamma_y = params$gamma_y[i],
+    #gamma_x = params$gamma[i],
+    #gamma_y = params$gamma[i],
+    transform = "STANDARDIZE", 
+    max_iterations = 2000,
+    #impute_original = TRUE,
+    max_runtime_secs = 1000,
+    seed = 1,
+    loss_by_col_idx = losses$index,
+    loss_by_col = losses$loss)
+  
+  summ_text = capture.output({ h2o::summary(glrm_model) })
+  glrm_sum[[i]] = summ_text
+  h2o::summary(glrm_model)
+  plot(glrm_model)
+  #print(summ_text)
+  
+  params$objective[i] = glrm_model@model$objective
+  
+  # Predict on validation set and extract error
+  # Warning: this can throw java.lang.ArrayIndexOutOfBoundsException
+  try({
+    validate = h2o::h2o.performance(glrm_model, valid)
+    #print(validate@metrics)
+    glrm_metrics[[i]] = validate@metrics
+    
+    params$error_num[i] = validate@metrics$numerr
+    params$error_cat[i] = validate@metrics$caterr
+    
+  })
+  
+  # Removing the model prevents the index error from occurring!
+  h2o::h2o.rm(glrm_model)
+  
+  # Save after each iteration in case it crashes.
+  # This could go inside the try()
+  # params should be the first object.
+    save(params, glrm_metrics, glrm_sum,
+       file = "data/glrm-tuned-results.RData")
+}
+})
+
+params$error = params$error_num + params$error_cat
+
+save(params, glrm_metrics, glrm_sum,
+     file = "data/glrm-tuned-results.RData")
+
+qplot(params$error) + theme_minimal() +
+  labs(x = "Test set error")
+
+params = params %>% arrange(error) %>% as.data.frame()
+
+# Look at the top 10 models with the lowest error rate
+head(params, 25)
+
+# Look at the worst models
+tail(params, 25)
+
+rio::export(params, file = "tables/glrm-grid-search.xlsx", overwrite = TRUE)
+```
+
+### Apply best GLRM
+
+This is cached to speed up recompiling.
+
+```{r tuned_glrm, cache = TRUE}
+#params = rio::import("tables/glrm-grid-search.xlsx")
+
+#(best_params = params %>% arrange(error) %>% as.data.frame() %>% head(1))
+best_params = data.frame(
+  k = 50,
+  regularization_x = "Quadratic",
+  regularization_y = "L1",
+  gamma_x = 4,
+  gamma_y = 24,
+  stringsAsFactors = FALSE
+)
+
+# This takes 18 mins (Hinge loss for binaries) or 41 mins (Logistic loss) on a 4-core laptop.
+# Only 3 minutes on Lawrence's 16-core server. 
+system.time({
+  # Now run on full dataset.
+glrm_result =
+  h2o::h2o.glrm(training_frame = h2o_df, cols = colnames(h2o_df),
+           loss = "Quadratic",
+           model_id = "impute_glrm",
+           seed = 1,
+           k = best_params$k,
+           max_iterations = 2000,
+           # This is necessary to ensure that the model can optimize, otherwise
+           # there may be no improvement in the objective.
+           transform = "STANDARDIZE", 
+           # "None" is already the default, but we are being explicit.
+           regularization_x = best_params$regularization_x,
+           regularization_y = best_params$regularization_y,
+           gamma_x = best_params$gamma_x,
+           gamma_y = best_params$gamma_y,
+           loss_by_col_idx = losses$index,
+           loss_by_col = losses$loss)
+})
+
+# Good improvement in objective over the course of 424 steps.
+h2o::summary(glrm_result)
+glrm_result
+plot(glrm_result)
+
+# Don't use h2o's provided model$importance statistics, they are flawed.
+# We need to calculate these manually for now (Apr. 2020).
+
+# Extract compressed dataset.
+new_data = as.data.frame(h2o::h2o.getFrame(glrm_result@model$representation_name))
+
+# Calculate variances for each archetype.
+(variances = sapply(new_data, stats::var))
+
+# Sort variances in descending order
+(variances = variances[order(variances, decreasing = TRUE)])
+
+glrm_vars = data.frame(variances, pct_total = variances / sum(variances))
+glrm_vars$cumulative_pct = cumsum(glrm_vars$pct_total)
+glrm_vars$order = seq(nrow(glrm_vars))
+
+glrm_vars
+
+data.frame(
+    component  = glrm_vars$order,
+    PVE = glrm_vars$pct_total,
+    CVE = glrm_vars$cumulative_pct
+) %>%
+    tidyr::gather(metric, variance_explained, -component) %>%
+    ggplot(aes(component, variance_explained)) +
+    geom_point() + theme_minimal() + 
+    facet_wrap(~ metric, ncol = 1, scales = "free")
+ggsave("visuals/imputation-glrm-component-plot-custom.png")
+
+# Examine how many components (archetypes) to use.
+library(dplyr)
+library(ggplot2)
+
+# Reconstructed data from GLRM.
+recon_df = h2o::h2o.reconstruct(glrm_result, h2o_df,
+                                reverse_transform = TRUE)
+# Fix column names.
+names(recon_df) = names(impute_df)
+
+# Convert from h2o object back to an R df.
+# This takes ~10 seconds.
+recon_df = as.data.frame(recon_df)
+
+# Compare imputed values to known values.
+known_age = !is.na(impute_df$age)
+# Examine RMSE = 0.41
+sqrt(mean((impute_df$age[known_age] - recon_df$age[known_age])^2))
+# Compare to median imputation, RMSE = 16.4
+sqrt(mean((impute_df$age[known_age] - median(impute_df$age[known_age]))^2))
+# Compare to mean imputation, RMSE = 16.4
+sqrt(mean((impute_df$age[known_age] - mean(impute_df$age[known_age]))^2))
+
+# Note that it hasn't respected the bounds of the original age variable.
+# Min = 16 but it should be 18
+summary(recon_df$age)
+
+table(recon_df$obesity)
+
+# Obesity got turned into a factor for some reason.
+# Most likely due to the loss function.
+recon_df$obesity = as.integer(recon_df$obesity)
+```
+
+### Evaluate imputation
+
+```{r impute_eval}
+
+# Calculate median/mode imputation for comparison to GLRM.
+impute_info =
+  ck37r::impute_missing_values(data,
+                               skip_vars = c(vars$exclude, vars$outcome),
+                               # Don't add indicators as we've already created those.
+                               add_indicators = FALSE,
+                               # use glrm
+                               type = "standard",
+                               verbose = TRUE)
+
+# Skip race because it's categorical.
+# Also skip the notes variables that we just want to impute to 0.
+vars_with_missingness =
+  var_df$var[var_df$missingness > 0 & !var_df$var %in% c("race") &
+             !var_df$var %in% impute_to_0_vars]
+
+# Bound GLRM variables back to the original bounds.
+for (var in vars_with_missingness) {
+  row = var_df[var_df$var == var, , drop = FALSE]
+  
+  # Skip factor vars.
+  if (row$class != "factor") {
+    recon_df[[var]] = pmin(pmax(recon_df[[var]], row$min), row$max)
+  }
+}
+
+# Round integer and ordinal vars back to be integers.
+for (var in c(vars$integers, vars$ordinal)) {
+  recon_df[[var]] = as.integer(round(recon_df[[var]]))
+}
+
+
+# Loop over each variable and compare GLRM imputation to median/mode imputation
+# Use RMSE as a comparison metric.
+impute_compare = data.frame(var = vars_with_missingness,
+                            loss = losses[var_df$var %in% vars_with_missingness, "loss"],
+                            missingness = var_df[var_df$var %in% vars_with_missingness, "missingness"],
+                            error_glrm = NA,
+                            error_median = NA,
+                            pct_reduction = NA,
+                            stringsAsFactors = FALSE)
+
+for (var in impute_compare$var) {
+  # Obesity became a factor?
+  cat("Analzying", var, class(data[[var]]), class(recon_df[[var]]), "\n")
+  
+  # Analyze the rows in which the variable is not missing.
+  observed_rows = !is.na(data[[var]])
+  
+  # Calculate RMSE for GLRM.
+  error_glrm = sqrt(mean((impute_df[observed_rows, var] -
+                          recon_df[observed_rows, var])^2))
+  
+  # Compare to median imputation.
+  error_median = sqrt(mean((impute_df[observed_rows, var] -
+                            impute_info$impute_values[[var]])^2))
+  
+  # Save results
+  impute_compare[impute_compare$var == var,
+                 c("error_glrm", "error_median")] = c(error_glrm, error_median)
+}
+
+impute_compare$pct_reduction =  1 - impute_compare$error_glrm / impute_compare$error_median
+
+# Obesity does not look better for some reason - need to double-check.
+# It was the only binary variable and we used Hinge loss.
+(impute_compare = impute_compare %>% arrange(desc(missingness)) %>% as.data.frame())
+
+cat("Average percent reduction in RMSE:",
+    round(100 * mean(impute_compare$pct_reduction), 1), "\n")
+
+save(impute_compare, file = "data/imputation-comparison-glrm.RData")
+
+# Make a separate copy for use in the paper.
+imput_comp = impute_compare
+
+imput_comp$pct_reduction = round(imput_comp$pct_reduction * 100, 2)
+imput_comp$missingness = round(imput_comp$missingness * 100, 2)
+
+# Remove loss column.
+imput_comp$loss = NULL
+
+names(imput_comp) = c("Variable", "Missingness", "Error GLRM", "Error Median", "Percent reduction")
+
+imput_comp$Variable =
+  c("HbA1c", "Triglycerides", "HDL", "Total Chol.", "LDL", "GFR", "Trop. 3HV",
+    "ECG", "BMI", "Obese", "Respiration", "O2 Saturation", "Pulse", "Pulse Peak",
+    "SBP", "Lowest SBP")
+
+imput_comp
+
+(kab_table = kable(imput_comp, format = "latex", digits = c(1, 1, 3, 3, 1),
+                   caption = "Comparing missing value imputation using GLRM versus median/mode",
+                   label = "imputation-comparison",
+                   booktabs = TRUE))
+cat(kab_table %>% kable_styling(latex_options = "striped"),
+    file = "tables/imputation-comparison-glrm.tex")
+
+rio::export(imput_comp, file = "tables/imputation-comparison-glrm.xlsx", overwrite = TRUE)
+```
+
+### Replace missing values.
+
+```{r replace_missing_values}
+
+# Now replace the missing values with imputed values.
+for (var in impute_compare$var) {
+  
+  # Analyze the rows in which the variable is not missing.
+  missing_rows = is.na(data[[var]])
+  
+  data[missing_rows, var] = recon_df[missing_rows, var]
+}
+
+# Should be all 0's.
+summary(colMeans(is.na(data)))
+colSums(is.na(data[, vars$covariates]))
+
+#data = cbind(impute_info$data, miss_inds)
+data = cbind(data, miss_inds)
+impute_info$data = NULL
+
+colnames(data)
+
+# Update the covariates with the new missingness indicators.
+(vars$covariates = setdiff(names(data), c(vars$exclude, vars$outcomes)))
+
+# Set group for the missingness indicators
+vars$groups$missing = colnames(miss_inds)
+
+```
+
+
+## Update predictor summary
+
+```{r revised_summary}
+result = summarize_predictors(data, vars$covariates, vars$groups, vars$integers, vars$ordinal)
+
+var_df = result$table
+
+# Add descriptive name
+var_df = dplyr::left_join(var_df, name_df[, !names(name_df) %in% c("group")], by = "var")
+
+# Export as a spreadsheet
+rio::export(var_df, file = "tables/predictor-summary-imputed.xlsx", overwrite = TRUE)
+
+data = result$data
+```
+
+## Histogram condense
+
+Apply histogram condensing to high-cardinality features
+
+```{r histogram_condense}
+# These are the continuous vars with moderate or high missingness.
+(dense_vars = var_df[var_df$uniq_vals > 500, c("var", "uniq_vals")])
+
+# This includes more integer vars that can't have too excessive of cardinality.
+(dense_vars = var_df[var_df$uniq_vals > 200, c("var", "uniq_vals")])
+
+#summary(data[[dense_vars]])
+#tail(sort(data[[dense_vars]]), n = 30)
+
+hist_bins = 200L
+for (dense_var in dense_vars$var) {
+  # Confirm it has a large number of unique values.
+  num_unique = length(unique(data[[dense_var]]))
+  if (num_unique > 200) {
+    print(qplot(data[[dense_var]]) + theme_minimal() +
+      labs(x = dense_var, y = "original values"))
+    
+    # This is not being used.
+    #hist_vec = hist(data[[dense_var]],
+    #                breaks = hist_bins,
+    #                plot = TRUE)
+    
+    # Try histogram binning vs. equal-sized group binning.
+    hist_vec2 = histogram::histogram(data[[dense_var]],
+                                     control = list(maxbin = hist_bins))
+    
+    # Apply histogram binning to original data vector.
+    cuts = cut(data[[dense_var]], breaks = hist_vec2$breaks,
+               # If we don't specify this, all obs with lowest value will get an NA.
+               include.lowest = TRUE)
+    #cuts = Hmisc::cut2(data[[dense_var]], breaks = hist_vec2$breaks)
+    
+    
+    # Use the midpoint of each bin as the new value.
+    mid_vals = hist_vec2$mids[as.numeric(cuts)]
+    
+    #compare_df = data.frame(data[[dense_var]], cuts, mid_vals)
+    #head(compare_df)
+    #sapply(compare_df, function(col) length(unique(col)))
+    
+    # Check for missing values in the dense vars.
+    if (sum(is.na(mid_vals)) > 0) {
+      stop("missing values in mid_vals")
+    }
+    
+    # Update variable to use the mid_vals
+    data[[dense_var]] = mid_vals
+    print(qplot(mid_vals) + labs(x = dense_var, y = "mid_vals") + theme_minimal())
+  }
+  
+}
+
+# Check for missing data.
+colSums(is.na(data[, dense_vars$var]))
+```
+
+## Update predictor summary
+
+```{r revised_summary_condensed}
+result = summarize_predictors(data, vars$covariates, vars$groups, vars$integers, vars$ordinal)
+
+var_df = result$table
+
+# Add descriptive name
+var_df = dplyr::left_join(var_df, name_df[, !names(name_df) %in% c("group")], by = "var")
+
+# Export as a spreadsheet
+rio::export(var_df, file = "tables/predictor-summary-imputed-condensed.xlsx", overwrite = TRUE)
+
+```
+
+## Convert factors to indicators
+
+```{r factors_to_indicators}
+
+result = ck37r::factors_to_indicators(data[vars$covariates], verbose = TRUE)
+names(result)
+data[vars$covariates] = NULL
+data = cbind(data, result$data)
+(vars$covariates = c(setdiff(vars$covariates, "race"), as.vector(result$factor_names)))
+```
+
+## Remove collinear columns
+
+This has to come after imputation because it can't work with missing data (at least currently).
+
+```{r remove_collinear}
+colSums(is.na(data[, vars$covariates]))
+
+# Remove linearly correlated columns from the covariate file
+# NOTE: assumes that there are no factor variables.
+linear_combos = caret::findLinearCombos(data[, vars$covariates])
+
+if (length(linear_combos$remove) > 0L) {
+
+  if (conf$verbose) {
+    cat("Removing", length(linear_combos$remove), "covariates due to collinearity.\n")
+    cat("Vars:", paste0(vars$covariates[linear_combos$remove], collapse = ", "), "\n")
+  }
+  
+  # Make sure we don't switch to a vector if only 1 column remains.
+  data = data[, !colnames(data) %in% vars$covariates[linear_combos$remove],
+              drop = FALSE]
+  
+  vars$covariates = setdiff(vars$covariates, vars$covariates[linear_combos$remove])
+  
+  if (conf$verbose) {
+    cat("Updated covariate count:", length(vars$covariates), "\n")
+  }
+} else {
+  cat("No linear duplication found.\n")
+}
+
+rm(linear_combos)
+
+```
+
+## Confirm matrix invertibility
+
+```{r confirm_invertible}
+# Compute covariance matrix.
+# NOTE: this requires that no factors be included.
+cov_mat = cov(data[vars$covariates])
+  
+# Compute QR decomposition of covariance matrix.
+qr_cov = qr(cov_mat)
+
+# These need to be equal for the covariance matrix to be full rank.
+# Caret's findLinearCombos seems to leave out 1 column.
+if (ncol(cov_mat) != qr_cov$rank && conf$verbose) {
+  cat("Warning: covariance matrix of covariates is not full rank.\n")
+  cat("Covariance columns:", ncol(cov_mat), "QR rank:", qr_cov$rank, "\n")
+} else {
+  cat("Covariate matrix is full rank.\n")
+}
+rm(cov_mat, qr_cov)
+```
+
+## Final variable summary table
+
+Generate a nice kable() summary of predictors for inclusion in manuscript.
+
+```{r var_summary}
+head(var_df)
+
+kab_df = var_df[, c("group", "name",# "type",
+                    "uniq_vals", "mode", "mean", "median", "min", "max")]
+
+# Make a df backup for later substitiion
+kab_df_unrounded = kab_df
+
+# Extract the value of the race row's $mode.
+(race_mode = subset(var_df, name == "Race", select = mode, drop = TRUE))
+
+# Cleanup race mode (remove initial number and space - take all characters starting at the 3rd char.)
+(race_mode = substring(race_mode, 3))
+
+# Made mode numeric, even though this will warn about creating a missing value for race.
+kab_df$mode = as.numeric(kab_df$mode)
+
+head(kab_df)
+
+
+# Cells that should have three decimal points (mode -> maximum cols)
+cols = c("mode", "mean", "median", "min", "max")
+
+# Round all numeric columns to 0 decimal points initially.
+kab_df = kab_df %>% dplyr::mutate(dplyr::across(where(is.numeric) & !any_of(cols), round, 0))
+
+head(kab_df)
+
+# Now apply 3-decimal point rounding
+kab_df = kab_df %>% dplyr::mutate(dplyr::across(any_of(cols), round, 2))
+
+head(kab_df)
+
+# Cells that should have three decimal points (mean only)
+# High EDACS, High HEART, Obesity, Male, notes, history, missing
+
+# troponin
+
+# Cells with 1 decimal point:
+# hb1ac, HEART, 
+
+# Substitute race mode back into column (making everything else a string)
+kab_df$mode = as.character(kab_df$mode)
+kab_df[kab_df$name == "Race", "mode"] = race_mode
+
+head(kab_df)
+
+unique(var_df$group)
+
+# Change group to a factor for re-ordering purposes.
+kab_df$group = factor(kab_df$group, levels = c("biomarker", "score", "labs", "vitals", "demo", "notes", "history", "missing"))
+
+kab_df = kab_df %>% dplyr::arrange(group, name) %>% as.data.frame()
+
+kab_df
+
+names(kab_df) = c("Group", "\\thead{Name}",#"\\thead{Type}",
+                  "\\thead{Unique\\\\values}", "\\thead{Mode}",
+                  "\\thead{Mean}", "\\thead{Median}",
+                  "\\thead{Minimum}", "\\thead{Maximum}")
+
+# Hide NA values
+options(knitr.kable.NA = '-')
+
+kab_tab = kable(kab_df[, !names(kab_df) %in% c("Group")],
+                booktabs = TRUE, 
+                longtable = TRUE,
+                digits = 4,
+                caption = "Summary of predictors",
+                escape = FALSE,
+                label = "predictor-summary",
+                row.names = TRUE,
+                format = "latex")
+
+cat(kab_tab %>%
+      kable_styling(latex_options = c("striped", "repeat_header")) %>%
+      pack_rows("Biomarkers", 1, 4) %>%
+      pack_rows("Scores", 5, 8) %>%
+      pack_rows("Labs", 9, 14) %>%
+      pack_rows("Vitals", 15, 22) %>%
+      pack_rows("Demographics", 23, 25) %>%
+      pack_rows("Clinical notes", 26, 31) %>%
+      pack_rows("History", 32, 51) %>%
+      pack_rows("Missingness indicators", 52, 71),
+    file = "tables/predictor-summary.tex")
+```
+
+## Save imputed dataset
+
+```{r save_imputed}
+save(data, impute_info, vars, var_df,
+     file =  paste0(data_dir, "import-data-imputed.RData"))
+```
+

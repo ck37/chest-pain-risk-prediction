@@ -1,0 +1,21 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+#
+*.html
+*.RData
+*.tex
+*.png
+tables/*.xlsx
+*.pdf
+*.sas7bdat
+
+# Tex files
+*.log
+*.gz
+*.toc
+
+*.DS_Store
+*_cache/

@@ -1,0 +1,225 @@
+---
+title: ''
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source("R/_startup.R")
+startup(auto_install = FALSE, verbose = TRUE)
+ck37r::load_all_code("R", verbose = TRUE)
+
+#remotes::install_github("christophM/iml")
+# Using this version:
+# remotes::install_github("ck37/iml")
+library(iml)
+library(mlr)
+```
+
+## Load data
+
+```{r load_data}
+load(paste0(data_dir, "import-data-imputed.RData"))
+names(data)
+# 116,711 obs and 102 variables
+dim(data)
+# 74 covariates
+length(vars$covariates)
+
+# ads60d
+(outcome_field = vars$outcomes[1])
+
+# 52.3
+(positive_weight = sum(1 - data[[outcome_field]]) / sum(data[[outcome_field]]))
+```
+
+
+## Covar prep
+
+```{r covar_prep}
+# Fit a new rpart from scratch.
+df = data[, c(vars$covariates, outcome_field)]
+df[[outcome_field]] = factor(df[[outcome_field]])
+
+case_weights = rep(1, nrow(data))
+
+# Set the positive weight to be the ratio of positive to negative cases.
+# This allows the negative case weights to remain 1.
+# Alternatively we could use inverse probability weights for both positive
+# and negative cases.
+case_weights[data[[outcome_field]] == 1] = positive_weight
+
+table(case_weights)
+```
+
+## Accumulated local effect plot
+
+### Calculate effects
+
+```{r ale_plots}
+
+task = makeClassifTask(data = df[, c(vars$covariates, outcome_field)],
+                       target = outcome_field)
+
+learner = makeLearner("classif.ranger",
+                      predict.type = "prob",
+                      mtry = 4,
+                      num.trees = 2000L,
+                      num.threads = floor(RhpcBLASctl::get_num_cores() / 2))
+
+# This takes 45 seconds with 16 cores and 2k trees.
+system.time({
+  mod.mlr = mlr::train(learner, task)
+})
+
+mod.mlr$learner.model
+```
+
+Use cvsl with iml ALE plots.
+
+```{r cvsl}
+# Generated in estimator-superlearner.Rmd
+load("data/estimator-cvsl.RData")
+
+mod2 = Predictor$new(cvsl, data = df[, !names(df) %in% outcome_field],
+                    y = df[[outcome_field]])
+
+features = c("age", "bmi_raw", "tot_choles", "ldl", "hdl", "pulse_peak", "sat",
+             "pulse", "sbp", "sbp_lowest", "trop3hv", "trop_peak", "heart", "edacs", "hgba1c")
+
+# Add future parallelization.
+
+library("future.callr")
+# Creates a PSOCK cluster with ~16 cores
+#plan("callr", workers = floor(RhpcBLASctl::get_num_cores() / 2))
+future::nbrOfWorkers()
+
+# Takes 145 minutes for all features with no parallelization.
+# 104 minutes for key continuous features and 16 cores parallelization.
+system.time({
+  effect2 = iml::FeatureEffects$new(mod2,
+                               grid.size = 32L,
+                               features = features)
+})
+
+save(effect2, file = "data/interpretation-iml-effects-v2.RData")
+```
+
+### Plot effects
+
+```{r plot_effects}
+load("data/interpretation-iml-effects-v2.RData")
+
+
+var = "age"
+var_display = "Age"
+
+# Try calculating one at a time.
+# This takes 30 seconds for age.
+system.time({
+  feat_eff = 
+    iml::FeatureEffect$new(mod2,
+                           #grid.size = 20L,
+                           grid.size = 32L,
+                           feature = var)
+})
+
+feat_eff$results
+
+feat_eff
+
+# What are the 99.9 and 0.1 quantiles for age?
+emp_cdf = ecdf(df[[var]])
+quantile(emp_cdf, c(0.001, 0.999))
+
+
+old_results = effect2$effects[[var]]$results
+effect2$effects[[var]]$results  = old_results[old_results$.class == 1, ]
+
+feat_eff = effect2$effects[[var]]
+
+(p = feat_eff$plot(rug = FALSE, ylim = ylim) +
+  theme_minimal() +
+#  theme(strip.text.x = element_blank()) +
+  labs(x = var_display, y = ""))
+
+str(p)
+
+# Density plot
+(p2 = ggplot(data = df, aes_string(x = var)) +
+  geom_density(fill = "gray70", color = "gray40") +
+  theme_minimal() + labs(y = "Sample\nDensity") +
+  #scale_x_log10(breaks = breaks, limits = limits) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 8),
+        # Include x-axis major gridlines to ensure that plots are aligned.
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank()))
+
+print(cowplot::plot_grid(p, p2, align = "v", ncol = 1, rel_heights = c(0.9, 0.1)))
+
+plot_ale = function(var, var_display, ylim = NULL) {
+  
+  old_results = effect2$effects[[var]]$results
+  effect2$effects[[var]]$results  = old_results[old_results$.class == 1, ]
+  
+  (p = effect2$effects[[var]]$plot(rug = FALSE, ylim = ylim) +
+    theme_minimal() +
+    labs(y = "") +
+    theme(strip.text.x = element_blank()) +
+    labs(x = var_display))
+  
+  # Density plot
+  (p2 = ggplot(data = df, aes_string(x = var)) +
+    geom_density(fill = "gray70", color = "gray40") +
+    theme_minimal() + labs(y = "Sample\nDensity") +
+    #scale_x_log10(breaks = breaks, limits = limits) +
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 8),
+          # Include x-axis major gridlines to ensure that plots are aligned.
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank()))
+  
+  print(cowplot::plot_grid(p, p2, align = "v", ncol = 1, rel_heights = c(0.9, 0.1)))
+  
+  ggsave(paste0("visuals/ale-", var, ".pdf"), width = 4, height = 4)
+}
+
+ylim = c(-0.005, 0.08)
+
+
+plot_ale("age", "Age", ylim = ylim)
+
+plot_ale("bmi_raw", "Body mass index", ylim = ylim)
+
+plot_ale("tot_choles", "Total cholesterol", ylim = ylim)
+
+plot_ale("ldl", "LDL", ylim = ylim)
+
+plot_ale("hdl", "HDL", ylim = ylim)
+
+plot_ale("pulse_peak", "Pulse peak", ylim = ylim)
+
+plot_ale("pulse", "Pulse", ylim = ylim)
+
+plot_ale("sbp", "Systolic blood pressure", ylim = ylim)
+
+plot_ale("sbp_lowest", "Systolic blood pressure lowest", ylim = ylim)
+
+plot_ale("trop3hv", "Trop. 3HV", ylim = ylim)
+
+plot_ale("trop_peak", "Trop. peak", ylim = ylim)
+
+plot_ale("heart", "HEART", ylim = ylim)
+
+plot_ale("edacs", "EDACS", ylim = ylim)
+
+plot_ale("hgba1c", "HbA1c", ylim = ylim)
+
+plot_ale("sat", "Oxygen saturation", ylim = ylim)
+```
